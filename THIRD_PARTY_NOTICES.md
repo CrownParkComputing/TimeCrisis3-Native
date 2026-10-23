@@ -1,0 +1,7 @@
+# Third-party notices
+
+- **PCSX2 / PCSX2x6:** the playable host and compatibility integration derive from the PCSX2 Dev Team's GPL-3.0-or-later code and the PS2Homebrew-arcade fork. The exact repository, commit and license file are recorded in `third_party/pcsx2.lock.json`. The exported source and its bundled dependency licenses remain in the private build tree; retain those notices when distributing a derived binary. Project source is licensed under `COPYING` (GPL version 3, or later where stated in source headers).
+- **Nuklear:** `third_party/nuklear/nuklear.h` is the unchanged single-header library from Immediate-Mode-UI/Nuklear, obtained through the locally available DriveClub-Linux checkout. This project elects its MIT license; the full terms, third-party notices and embedded ProggyClean font license are in that header. See `third_party/nuklear/ORIGIN.txt`.
+- **DriveClub-Linux:** the Nuklear menu layout follows the local project's GPL-2.0-or-later menu implementation; incorporated layout adaptation is distributed under GPL-3.0-or-later. No DriveClub game assets are included.
+- **Sinden:** the application independently detects USB descriptors and draws a border. The official driver is separately downloaded under Sinden's terms. Sinden marks belong to Sinden Technology Ltd.
+- **Time Crisis:** game screenshots document compatibility testing. Game content and trademarks belong to Bandai Namco and their respective rights holders. The source license does not grant rights to game data or firmware.

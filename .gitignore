@@ -1,0 +1,27 @@
+# Private assets, source exports and local diagnostics.
+.local/
+build*/
+__pycache__/
+*.py[cod]
+*.iso
+*.chd
+*.squashfs
+*.elf
+*.ps2
+*.p2s
+*.nvm
+*.mec
+*.bin
+*.acgame
+*.zip
+*.7z
+*.tar*
+*.log
+*.core
+core
+core.*
+.env
+.env.*
+*.pem
+*.key
+# Public source metadata and intentional docs/screenshots are tracked.

@@ -1,0 +1,61 @@
+--- a/pcsx2/x86/ix86-32/iR5900.cpp
++++ b/pcsx2/x86/ix86-32/iR5900.cpp
+@@ -24,6 +24,9 @@
+ 
+ // Only for MOVQ workaround.
+ #include "common/emitter/internal.h"
++#ifdef TC3_ENABLE_NATIVE_BLOCK_PROOF
++#include "pcsx2_block_bridge.h"
++#endif
+ 
+ //#define DUMP_BLOCKS 1
+ //#define TRACE_BLOCKS 1
+@@ -376,6 +379,19 @@
+ 	pxAssertMsg(DispatcherReg != NULL, "Please compile the DispatcherReg subroutine *before* JITComple.  Thanks.");
+ 
+ 	u8* retval = xGetAlignedCallTarget();
++
++#ifdef TC3_ENABLE_NATIVE_BLOCK_PROOF
++	// A bounded, byte-verified block may run against canonical cpuRegs.
++	// The ordinary JIT remains the fallback for every rejected/unknown PC.
++	xFastCall((const void*)tc3TryNativeBlockProof);
++	xTEST(eax, eax);
++	xForwardJZ32 ordinary_jit;
++	xMOV(rax, ptr64[&cpuRegs.cycle]);
++	xSUB(rax, ptr64[&cpuRegs.nextEventCycle]);
++	xJS(DispatcherReg);
++	xJMP(DispatcherEvent);
++	ordinary_jit.SetTarget();
++#endif
+ 
+ 	xFastCall((const void*)recRecompile, ptr32[&cpuRegs.pc]);
+ 
+@@ -604,6 +620,9 @@
+ ////////////////////////////////////////////////////
+ static void recResetRaw()
+ {
++#ifdef TC3_ENABLE_NATIVE_BLOCK_PROOF
++	tc3NativeBlockProofClearBinding(); // Loader must revalidate after reset.
++#endif
+ 	Console.WriteLn(Color_StrongBlack, "EE/iR5900 Recompiler Reset");
+ 
+ 	if (CHECK_EXTRAMEM != extraRam)
+--- a/pcsx2/CMakeLists.txt
++++ b/pcsx2/CMakeLists.txt
+@@ -1486,3 +1486,16 @@
+ source_group(Resources/PAD FILES ${pcsx2PADResources})
+ source_group(Resources/Recording FILES ${pcsx2RecordingVirtualPadResources})
+ source_group(Resources REGULAR_EXPRESSION ${CMAKE_CURRENT_BINARY_DIR}/*)
++
++# Optional isolated TC3 scalar-block proof. The default compatibility core
++# and its CPU/device implementations remain the pinned upstream behavior.
++set(TC3_NATIVE_BLOCK_PROOF_ROOT "" CACHE PATH "TC3 native block proof sources")
++if(TC3_NATIVE_BLOCK_PROOF_ROOT)
++  target_sources(PCSX2 PRIVATE
++    "${TC3_NATIVE_BLOCK_PROOF_ROOT}/native_block_provider.cpp"
++    "${TC3_NATIVE_BLOCK_PROOF_ROOT}/pcsx2_block_bridge.cpp")
++  set_property(SOURCE x86/ix86-32/iR5900.cpp APPEND PROPERTY
++    INCLUDE_DIRECTORIES "${TC3_NATIVE_BLOCK_PROOF_ROOT}")
++  set_property(SOURCE x86/ix86-32/iR5900.cpp APPEND PROPERTY
++    COMPILE_DEFINITIONS TC3_ENABLE_NATIVE_BLOCK_PROOF=1)
++endif()

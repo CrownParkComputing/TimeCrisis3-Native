@@ -1,0 +1,17 @@
+name: Component tests
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure without game assets or graphics dependencies
+        run: cmake -S . -B build -DTC3_BUILD_HOST=OFF -DTC3_BUILD_NATIVE_BLOCK_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j2
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Check Python syntax
+        run: python3 -m compileall -q tools tests

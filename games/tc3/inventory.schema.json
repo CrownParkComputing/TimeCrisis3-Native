@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Private TC3 input inventory",
+  "type": "object",
+  "required": ["schema_version", "title", "bootstrap_verified", "pinned_bootstrap_paths", "inputs", "missing_inputs", "coverage"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "title": {"const": "Time Crisis 3"},
+    "bootstrap_verified": {"type": "boolean"},
+    "pinned_bootstrap_paths": {"type": "array", "items": {"type": "string"}},
+    "missing_inputs": {"type": "array", "items": {"type": "string"}},
+    "inputs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "size", "images", "rejected_elf_candidates", "classification"],
+        "properties": {
+          "path": {"type": "string"},
+          "size": {"type": "integer", "minimum": 0},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "classification": {"enum": ["elf_container", "unrecognized_payload", "empty"]},
+          "images": {"type": "array", "items": {"type": "object", "required": ["offset", "type", "machine", "entry", "segments", "executable_sections", "classification", "warnings"]}},
+          "rejected_elf_candidates": {"type": "array"}
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "required": ["native_validated_images", "complete_native_coverage", "limitations"],
+      "properties": {
+        "native_validated_images": {"const": 0},
+        "complete_native_coverage": {"const": false},
+        "limitations": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}

@@ -1,0 +1,6 @@
+Nuklear single-header library, copied from the locally available DriveClub-Linux
+runtime-linux/gpu/third_party/nuklear/nuklear.h on 2026-10-23.
+Upstream: https://github.com/Immediate-Mode-UI/Nuklear
+The unmodified header contains its full MIT/public-domain dual-license terms,
+third-party notices and embedded ProggyClean font license. This project elects
+MIT for this copy. No DriveClub game data or renderer code is included.

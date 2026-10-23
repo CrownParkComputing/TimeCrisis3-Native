@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "title": "Time Crisis 3",
+  "variant": "TST3 TC3LOAD",
+  "bootstrap_sha256": "35c08b7a7a18b52963072d8bdbf00d5252ce5d80f817a8ca668872ba7e95986d",
+  "policy": {
+    "unrecognized_code": "retain_pcsx2_execution",
+    "static_native_coverage": "none_validated",
+    "loadable_discovery": "headers_and_runtime_load_observation_required",
+    "inventory_output": ".local only; no proprietary payload bytes"
+  },
+  "executable_role": "boot_executable_and_main_gameplay",
+  "bootstrap_hash_key_note": "Compatibility name: this pins TC3LOAD, which contains observed main gameplay code, not only a bootstrap."
+}

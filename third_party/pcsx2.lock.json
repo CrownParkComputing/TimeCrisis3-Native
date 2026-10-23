@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/PS2Homebrew-arcade/pcsx2x6",
+  "commit": "583f0e90907d69bb2db670f570d0865260fcc71b",
+  "license": "GPL-3.0",
+  "license_file": "COPYING.GPLv3",
+  "role": "Timing, memory, device, graphics and audio compatibility foundation"
+}
