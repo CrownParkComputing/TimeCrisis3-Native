@@ -17,6 +17,7 @@ namespace {
 using namespace tc3::cabinet;
 struct State {
     std::unique_ptr<LocalTransport> transport;
+    const ModuleProfile* profile=nullptr;
     std::uint32_t module=0, delay=0, thbase=0;
     unsigned role=0;
     std::uint64_t sent=0,received=0,waits=0;
@@ -62,15 +63,15 @@ int finish(std::int32_t result) {
 }
 std::optional<std::uint32_t> socket_address(GuestRam& ram,std::uint32_t id) {
     auto base=state.module;
-    if(!is_original_module(ram,base)) return std::nullopt;
-    auto count=ram.read32(base+0x28e0),array=ram.read32(base+0x2904);
+    if(!(state.profile && is_original_module(ram,base,false,*state.profile))) return std::nullopt;
+    auto count=ram.read32(base+0x28e0+state.profile->globals_delta),array=ram.read32(base+0x2904+state.profile->globals_delta);
     if(!array || count>64 || id>=count || !ram.valid(array,count*4)) return std::nullopt;
     auto socket=ram.read32(array+id*4);
     if(!socket || !ram.valid(socket,0x54)) return std::nullopt;
     return socket;
 }
 void poll_packets(GuestRam& ram) {
-    GuestQueue queue(ram,state.module);
+    GuestQueue queue(ram,state.module,*state.profile);
     for(unsigned i=0;i<64;++i) {
         auto received=state.transport->receive();
         if(received.error==std::errc::resource_unavailable_try_again || received.error==std::errc::operation_would_block) break;
@@ -101,15 +102,15 @@ int trace_open() {
     static unsigned count=0;auto ram=memory();
     if(++count<=16) std::fprintf(stdout,"[TC3 cabinet] Original Open domain=%u type=%u protocol=%u initialized_count=%d maxpayload=%u caller=%08x\n",
        psxRegs.GPR.n.a0,psxRegs.GPR.n.a1,psxRegs.GPR.n.a2,
-       state.module ? std::int32_t(ram.read32(state.module+0x28e0)) : -1,
-       state.module ? ram.read32(state.module+0x28e4) : 0,psxRegs.GPR.n.ra);
+       state.module ? std::int32_t(ram.read32(state.module+0x28e0+state.profile->globals_delta)) : -1,
+       state.module ? ram.read32(state.module+0x28e4+state.profile->globals_delta) : 0,psxRegs.GPR.n.ra);
     return 0;
 }
 int trace_bind() {
     static unsigned count=0;auto ram=memory();
-    if(count==0 && state.module && ram.valid(state.module,0x2930))
+    if(count==0 && state.module && ram.valid(state.module,state.profile->extent))
         std::fprintf(stdout,"[TC3 cabinet] Runtime ILSOCK header=%08x mode/version=%08x socketarray=%08x exports8=%08x exports14=%08x\n",
-          ram.read32(state.module),ram.read32(state.module+8),ram.read32(state.module+0x2904),
+          ram.read32(state.module),ram.read32(state.module+8),ram.read32(state.module+0x2904+state.profile->globals_delta),
           ram.read32(state.module+20+8*4),ram.read32(state.module+20+14*4));
     if(++count<=16) std::fprintf(stdout,"[TC3 cabinet] Original Bind socket=%d addr=%08x len=%u valid_socket=%d caller=%08x\n",
        std::int32_t(psxRegs.GPR.n.a0),psxRegs.GPR.n.a1,psxRegs.GPR.n.a2,
@@ -118,10 +119,10 @@ int trace_bind() {
 }
 int wait_event() {
     auto ram=memory();const auto& r=psxRegs.GPR.n;
-    if(!is_original_module(ram,state.module) || !state.delay || r.ra!=state.module+0x21a4 ||
+    if(!(state.profile && is_original_module(ram,state.module,false,*state.profile)) || !state.delay || r.ra!=state.module+state.profile->wait_return ||
        r.a1!=1 || r.a2!=0x11 || !ram.valid(r.s2,0x54) ||
        ram.read32(r.s2+0x50)!=r.a0) return 0;
-    const auto count=ram.read32(state.module+0x28e0),array=ram.read32(state.module+0x2904);
+    const auto count=ram.read32(state.module+0x28e0+state.profile->globals_delta),array=ram.read32(state.module+0x2904+state.profile->globals_delta);
     bool ours=false;
     if(count<=64 && array && ram.valid(array,count*4))
         for(std::uint32_t i=0;i<count;++i) ours|=ram.read32(array+4*i)==r.s2;
@@ -162,7 +163,7 @@ int send_common(bool to) {
     auto ram=memory();auto& r=psxRegs.GPR.n;
     auto socket=socket_address(ram,r.a0);
     if(!socket) return finish(-2004);
-    auto maximum=ram.read32(state.module+0x28e4);
+    auto maximum=ram.read32(state.module+0x28e4+state.profile->globals_delta);
     if(r.a2>maximum || r.a2>default_max_payload || !ram.valid(r.a1,r.a2)) return finish(-2007);
     Packet packet;
     if(to) {
@@ -186,11 +187,11 @@ int send_common(bool to) {
     if(std::int32_t(local)<0) {
         // Match original ephemeral allocation: raw LE word contains network-order port.
         for(unsigned attempt=0;attempt<0x4000;++attempt) {
-            auto counter=ram.read32(state.module+0x2900);
-            auto port=0xc000U+(counter&0x3fffU);ram.write32(state.module+0x2900,counter+1);
+            auto counter=ram.read32(state.module+0x2900+state.profile->globals_delta);
+            auto port=0xc000U+(counter&0x3fffU);ram.write32(state.module+0x2900+state.profile->globals_delta,counter+1);
             local=((port&255)<<8)|(port>>8);
             bool taken=false;
-            auto count=ram.read32(state.module+0x28e0),array=ram.read32(state.module+0x2904);
+            auto count=ram.read32(state.module+0x28e0+state.profile->globals_delta),array=ram.read32(state.module+0x2904+state.profile->globals_delta);
             for(unsigned i=0;i<count;++i) {
                 auto s=ram.read32(array+4*i);
                 if(s && ram.valid(s,12) && ram.read32(s+8)==local) taken=true;
@@ -204,7 +205,7 @@ int send_common(bool to) {
     auto source=iopMem->Main+(r.a1&0x1fffffffU);
     packet.payload.assign(source,source+r.a2);
     if(packet.destination.identity==state.local) {
-        GuestQueue queue(ram,state.module);
+        GuestQueue queue(ram,state.module,*state.profile);
         auto delivered=queue.inject(packet);
         return finish(delivered.outcome==GuestQueue::Outcome::Queued ? r.a2 : 0);
     }
@@ -260,14 +261,15 @@ void tc3CabinetRegisterExports(std::uint32_t table) {
         if(target && ram.valid(target,8)) {state.delay=target;state.thbase=table;}
     }
     if(name=="ilsocket") {
-        if(!is_original_module(ram,table,true)) {
+        const auto* profile=identify_module(ram,table,true);
+        if(!profile) {
             std::fprintf(stderr,"[TC3 cabinet] ILSOCK signature mismatch; transport guest adapter rejected\n");return;
         }
-        state.module=table;
-        std::fprintf(stdout,"[TC3 cabinet] Original ILSOCK verified at %08x; guest DelayThread=%08x\n",table,state.delay);
+        state.module=table;state.profile=profile;
+        std::fprintf(stdout,"[TC3 cabinet] Original ILSOCK verified at %08x; guest DelayThread=%08x; profile=%s\n",table,state.delay,profile->name);
     }
 }
 void tc3CabinetReleaseExports(std::uint32_t table) {
-    if(table==state.module) state.module=0;
+    if(table==state.module) {state.module=0;state.profile=nullptr;}
     if(table==state.thbase) {state.thbase=0;state.delay=0;}
 }

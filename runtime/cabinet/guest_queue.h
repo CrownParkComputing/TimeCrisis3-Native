@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "packet.h"
+#include "profile.h"
 #include <span>
 #include <stdexcept>
 
@@ -45,11 +46,12 @@ public:
         std::uint32_t wake_event=0;
         bool needs_wake=false;
     };
-    GuestQueue(GuestRam& ram,std::uint32_t module_base):ram_(ram),base_(module_base) {}
+    GuestQueue(GuestRam& ram,std::uint32_t module_base,const ModuleProfile& profile=tc3_profile)
+        :ram_(ram),base_(module_base),profile_(profile) {}
     Delivery inject(const Packet& packet) {
-        if(!ram_.valid(base_,0x2930)) return {Outcome::InvalidState};
-        const auto nsockets=ram_.read32(base_+0x28e0), array=ram_.read32(base_+0x2904);
-        const auto maximum=ram_.read32(base_+0x28e4);
+        if(!ram_.valid(base_,profile_.extent)) return {Outcome::InvalidState};
+        const auto nsockets=ram_.read32(base_+0x28e0+profile_.globals_delta), array=ram_.read32(base_+0x2904+profile_.globals_delta);
+        const auto maximum=ram_.read32(base_+0x28e4+profile_.globals_delta);
         if(nsockets==0 || nsockets>64 || !array || !ram_.valid(array,nsockets*4) ||
            maximum>default_max_payload) return {Outcome::InvalidState};
         auto encoded=encode_packet(packet);
@@ -60,7 +62,7 @@ public:
         };
         const auto low=word(packet.destination.identity,0), high=word(packet.destination.identity,4);
         // The original callback uses OR between individual GUID word matches.
-        if(low!=ram_.read32(base_+0x2918) && high!=ram_.read32(base_+0x291c) &&
+        if(low!=ram_.read32(base_+0x2918+profile_.globals_delta) && high!=ram_.read32(base_+0x291c+profile_.globals_delta) &&
            low!=0xffffffffU && high!=0xffffffffU) return {Outcome::ForeignDestination};
         const auto dst=std::uint32_t(packet.destination.port[0])|std::uint32_t(packet.destination.port[1])<<8;
         const auto src=std::uint32_t(packet.source.port[0])|std::uint32_t(packet.source.port[1])<<8;
@@ -79,7 +81,7 @@ public:
         if(capacity!=8 || write>=capacity || read>=capacity) return {Outcome::InvalidState};
         const auto used=(write+capacity-read)%capacity;
         if(used+1>=capacity) return {Outcome::Full};
-        const auto node=ram_.read32(base_+0x2920);
+        const auto node=ram_.read32(base_+0x2920+profile_.globals_delta);
         if(!node) return {Outcome::NoBuffers};
         if(!ram_.valid(node,0x24)) return {Outcome::InvalidState};
         const auto next=ram_.read32(node),payload=ram_.read32(node+0x20);
@@ -88,7 +90,7 @@ public:
         const auto event=ram_.read32(socket+0x50);
         if(used==0 && std::int32_t(event)<=0) return {Outcome::InvalidState};
         // All addresses and structural invariants checked before changing RAM.
-        ram_.write32(base_+0x2920,next);
+        ram_.write32(base_+0x2920+profile_.globals_delta,next);
         if(next) ram_.write32(next+4,0);
         ram_.write32(node+8,static_cast<std::uint32_t>(length));
         ram_.write(node+0xc,std::span<const std::uint8_t>(*encoded).first(header_size));
@@ -100,5 +102,6 @@ public:
 private:
     GuestRam& ram_;
     std::uint32_t base_;
+    ModuleProfile profile_;
 };
 } // namespace tc3::cabinet

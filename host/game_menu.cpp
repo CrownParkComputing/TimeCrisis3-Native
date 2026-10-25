@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "game_menu.h"
+#include "service_options.h"
 #include "../rendering/capabilities.h"
 #include "../input/sinden.h"
 #include <SDL3/SDL_events.h>
@@ -30,6 +31,7 @@ struct Shared {
     Snapshot snapshot;
     std::function<void(Action)> callback;
     std::function<void(rendering::Option, int)> option_callback;
+    std::function<void(const int*, int)> service_apply_callback;
     float x = 0, y = 0, wheel_x = 0, wheel_y = 0;
     bool down = false;
     std::vector<ButtonEvent> buttons;
@@ -53,6 +55,7 @@ void Dispatch(Action action)
     if (callback) callback(action);
 }
 
+} // namespace
 void SetOpen(bool value)
 {
     if (open.exchange(value) == value) return;
@@ -65,6 +68,7 @@ void SetOpen(bool value)
     }
     Dispatch(value ? Action::Pause : Action::Resume);
 }
+namespace {
 
 float TextWidth(nk_handle, float, const char* text, int length)
 {
@@ -147,6 +151,12 @@ void SetOptionCallback(std::function<void(rendering::Option, int)> callback)
 {
     std::lock_guard lock(shared.mutex);
     shared.option_callback = std::move(callback);
+}
+
+void SetServiceApplyCallback(std::function<void(const int* targets, int count)> callback)
+{
+    std::lock_guard lock(shared.mutex);
+    shared.service_apply_callback = std::move(callback);
 }
 
 void PublishSnapshot(const Snapshot& snapshot)
@@ -273,6 +283,85 @@ void Render()
     nk_input_button(&context, NK_BUTTON_LEFT, static_cast<int>(x*sx), static_cast<int>(y*sy), down);
     nk_input_scroll(&context, nk_vec2(wheel_x, wheel_y));
     nk_input_end(&context);
+    // Custom splash shown while the ROM still loads in the background: the
+    // GS presents long before the game produces its first frame. Each cabinet
+    // worker draws its own copy, tagged with its link side. The linked
+    // cabinet also shows it over the test menu — settings live on the
+    // primary screen only.
+    const bool serviceCover = snapshot.test_mode && snapshot.cabinet_role == 1;
+    if ((snapshot.loading || serviceCover) && !IsOpen() && size.x >= 80 && size.y >= 80) {
+        ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.015f, 0.02f, 0.05f, 1.0f));
+        if (ImGui::Begin("##boot_splash", nullptr,
+                         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_NoFocusOnAppearing)) {
+            const float cx = size.x * 0.5f;
+            auto* draw = ImGui::GetWindowDrawList();
+            ImFont* fnt = ImGui::GetFont();
+            auto centered = [&](const char* text, float y, ImU32 color, float px) {
+                const ImVec2 w = fnt->CalcTextSizeA(px, FLT_MAX, 0, text);
+                draw->AddText(fnt, px, {cx - w.x * 0.5f, y}, color, text);
+            };
+            const float big = std::clamp(size.y * 0.09f, 24.0f, 96.0f);
+            const float mid = std::clamp(size.y * 0.034f, 15.0f, 34.0f);
+            const float sml = std::clamp(size.y * 0.024f, 13.0f, 24.0f);
+            const ImU32 accent = snapshot.is_tc4 ? IM_COL32(255, 40, 40, 255)
+                                                 : IM_COL32(60, 160, 255, 255);
+            centered(snapshot.is_tc4 ? "TIME CRISIS 4" : "TIME CRISIS 3",
+                     size.y * 0.30f, accent, big);
+            centered(snapshot.is_tc4 ? "NAMCO SYSTEM 256" : "NAMCO SYSTEM 246",
+                     size.y * 0.30f + big * 1.3f,
+                     IM_COL32(200, 200, 210, 255), mid);
+            const char* status_text = serviceCover ? "SERVICE MODE (LINKED STANDBY)"
+                                                   : (snapshot.load_stage[0] ? snapshot.load_stage
+                                                                             : "Initializing...");
+            centered(status_text, size.y * 0.58f, IM_COL32(255, 220, 90, 255), sml);
+            // Live stage progress bar (or full bar in service standby).
+            const float bw = std::min(size.x * 0.46f, 560.0f), bh = 12.0f;
+            const float bx = cx - bw * 0.5f, by = size.y * 0.68f;
+            draw->AddRect({bx, by}, {bx + bw, by + bh}, IM_COL32(120, 120, 140, 255));
+            const float fill = serviceCover ? 1.0f : std::clamp(snapshot.load_progress, 0.05f, 1.0f);
+            draw->AddRectFilled({bx + 2, by + 2},
+                                {bx + 2 + (bw - 4) * fill, by + bh - 2},
+                                accent);
+            if (snapshot.cabinet_role >= 0)
+                centered(snapshot.cabinet_role == 0 ? "CABINET 1P (LEFT)" : "CABINET 2P (RIGHT)",
+                         size.y * 0.86f, IM_COL32(140, 160, 255, 255), mid);
+        }
+        ImGui::End();
+        ImGui::PopStyleColor();
+        nk_clear(&context);
+        return;
+    }
+    // Controls cheat-sheet popout shown whenever the original cabinet test
+    // menu is on screen, independent of the Nuklear menu being open. On the
+    // twin cabinet it stays on the primary screen only — the linked display
+    // shows the clean menu.
+    if (snapshot.test_mode && snapshot.cabinet_role != 1) {
+        const float w = 330.0f, h = 250.0f;
+        ImGui::SetNextWindowPos(ImVec2(size.x - w - 18, 18), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.82f);
+        if (ImGui::Begin("##cabinet_help", nullptr,
+                         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                         ImGuiWindowFlags_NoFocusOnAppearing)) {
+            ImGui::TextUnformatted("CABINET TEST MENU");
+            ImGui::Separator();
+            ImGui::BulletText("Move cursor:      Arrow Up / Down");
+            ImGui::BulletText("Adjust value:     Arrow Left / Right");
+            ImGui::BulletText("Select / confirm: E");
+            ImGui::BulletText("Start:            Return");
+            ImGui::BulletText("Service credit:   9");
+            ImGui::BulletText("Insert coin:      5");
+            ImGui::BulletText("Leave test menu:  F9 or F10 > Cabinet");
+            ImGui::Spacing();
+            ImGui::TextDisabled("Set options directly in F10 > Cabinet.");
+        }
+        ImGui::End();
+    }
     if (!IsOpen() || size.x < 80 || size.y < 80) {
         nk_clear(&context);
         return;
@@ -287,25 +376,35 @@ void Render()
     // (runtime-linux/gpu/shim/nk_menu.cpp, GPL-2.0-or-later).
     const float zoom = std::clamp(size.y / 1080.0f, 1.0f, 2.5f);
     const float row = std::max(26.0f * zoom, font.height + 6);
-    const char* tabs[] = {"File", "Display", "Performance", "Rendering", "Cabinet / Test"};
-    const int counts[] = {2, 4, 5, 12, 8};
-    const Action cabinet_actions[] = {Action::CabinetTest,Action::CabinetUp,Action::CabinetDown,
-        Action::CabinetLeft,Action::CabinetRight,Action::CabinetEnter,Action::CabinetService,Action::CabinetCoin};
-    const char* cabinet_labels[] = {"Toggle original test menu", "Test: Up", "Test: Down",
-        "Test: Left", "Test: Right", "Test: Enter / Button 1", "Service credit", "Insert coin"};
+    constexpr int kTabCount = 3;
+    const char* tabs[] = {"File", "Display & Rendering", "Cabinet / Service"};
+    const int service_count = snapshot.service_supported ? tc3::service::kOptionCount : 0;
+    const int has_save = service_count > 0 ? 1 : 0;
+    const int counts[] = {2, 11, service_count + has_save + 2};
+    if (page >= kTabCount) page = 0;
+    const Action cabinet_actions[] = {Action::CabinetService, Action::CabinetCoin};
+    const char* cabinet_labels[] = {"Service credit (9)", "Insert coin (5)"};
+    static int pending[tc3::service::kOptionCount]; // -2 = untouched
+    static int pending_page = -1;
+    if (page != 2) pending_page = -1;
+    else if (pending_page != 2) {
+        pending_page = 2;
+        for (int i = 0; i < service_count; ++i) pending[i] = -2;
+    }
     int cabinet_action = -1;
+    bool service_apply = false, twin_default_toggle = false;
     bool resume = false, quit = false, fullscreen = false, start_twin = false;
     std::vector<std::pair<rendering::Option, int>> changes;
     auto change = [&](rendering::Option option, int direction) {
         const auto& r = snapshot.rendering;
-        if (!r.ready || ((option == rendering::Option::CAS || option == rendering::Option::Sharpness) &&
-                         !r.cas_supported) || (option == rendering::Option::Sharpness && r.cas == 0)) return;
+        if (!r.ready) return;
+        if (option == rendering::Option::DLSS && !r.dlss_supported) return;
         changes.emplace_back(option, direction);
     };
     for (auto key : keys) {
         if (key == SDLK_TAB || key == SDLK_UNKNOWN ||
             ((key == SDLK_LEFT || key == SDLK_RIGHT) && selected < 0)) {
-            page = (page + (key == SDLK_LEFT || key == SDLK_UNKNOWN ? 4 : 1)) % 5;
+            page = (page + (key == SDLK_LEFT || key == SDLK_UNKNOWN ? kTabCount - 1 : 1)) % kTabCount;
             selected = -1;
         } else if (key == SDLK_DOWN) selected = (selected + 1) % counts[page];
         else if (key == SDLK_UP) selected = selected <= 0 ? -1 : selected - 1;
@@ -316,22 +415,33 @@ void Render()
             const int direction = key == SDLK_LEFT ? -1 : 1;
             if (page == 0 && selected == 0) resume = true;
             if (page == 0 && selected == 1) quit = true;
-            if (page == 1 && selected == 0 && !snapshot.twin_mode) fullscreen = true;
-            if (page == 1 && selected == 1 && !snapshot.twin_mode && snapshot.twin_supported) start_twin = true;
-            if (page == 1 && selected == 2) change(rendering::Option::SindenBorder, direction);
-            if (page == 1 && selected == 3) change(rendering::Option::BorderWidth, direction);
-            if (page == 2 && selected == 0) change(rendering::Option::VSync, direction);
-            if (page == 2 && selected == 1) change(rendering::Option::QueueDepth, direction);
-            if (page == 3 && selected >= 0 && selected < 4) {
-                const rendering::Option options[] = {rendering::Option::Resolution,
-                    rendering::Option::FXAA, rendering::Option::CAS, rendering::Option::Sharpness};
-                change(options[selected], direction);
+            if (page == 1) {
+                if (selected == 0 && !snapshot.twin_mode) fullscreen = true;
+                else if (selected == 1 && !snapshot.twin_mode && snapshot.twin_supported) start_twin = true;
+                else if (selected == 2 && snapshot.twin_supported) twin_default_toggle = true;
+                else if (selected == 3) change(rendering::Option::DisplaySize, direction);
+                else if (selected == 4) change(rendering::Option::Widescreen, direction);
+                else if (selected == 5) change(rendering::Option::Resolution, direction);
+                else if (selected == 6) change(rendering::Option::DLSS, direction);
+                else if (selected == 7) change(rendering::Option::FrameSkip, direction);
+                else if (selected == 8) change(rendering::Option::VSync, direction);
+                else if (selected == 9) change(rendering::Option::SindenBorder, direction);
+                else if (selected == 10) change(rendering::Option::BorderWidth, direction);
             }
-            if (page == 4 && selected >= 0) cabinet_action = selected;
+            if (page == 2 && selected >= 0) {
+                if (selected < service_count) {
+                    int& slot = pending[selected];
+                    if (slot == -2) slot = snapshot.service_values[selected];
+                    const int n = tc3::service::kOptions[selected].num_values;
+                    slot = ((slot < 0 ? 0 : slot) + direction + n) % n;
+                } else if (has_save && selected == service_count) service_apply = true;
+                else if (selected < service_count + has_save + 2)
+                    cabinet_action = selected - service_count - has_save;
+            }
         }
     }
-    float tab_x[5], tab_width[5], cursor = 4 * zoom;
-    for (int i = 0; i < 5; ++i) {
+    float tab_x[kTabCount], tab_width[kTabCount], cursor = 4 * zoom;
+    for (int i = 0; i < kTabCount; ++i) {
         tab_x[i] = cursor;
         tab_width[i] = (30 + 9 * std::strlen(tabs[i])) * zoom;
         cursor += tab_width[i] + 4 * zoom;
@@ -340,8 +450,8 @@ void Render()
     if (nk_begin(&context, "menubar", bar, NK_WINDOW_NO_SCROLLBAR)) {
         nk_window_set_bounds(&context, "menubar", bar);
         nk_menubar_begin(&context);
-        nk_layout_row_begin(&context, NK_STATIC, row - 4 * zoom, 6);
-        for (int i = 0; i < 5; ++i) {
+        nk_layout_row_begin(&context, NK_STATIC, row - 4 * zoom, kTabCount + 1);
+        for (int i = 0; i < kTabCount; ++i) {
             nk_layout_row_push(&context, tab_width[i]);
             nk_bool active = page == i;
             if (nk_selectable_label(&context, tabs[i], NK_TEXT_CENTERED, &active)) {
@@ -354,9 +464,9 @@ void Render()
         nk_menubar_end(&context);
     }
     nk_end(&context);
-    const float width = std::min((page == 0 ? 200.0f : 510.0f) * zoom, size.x - 8);
+    const float width = std::min((page == 0 ? 200.0f : 530.0f) * zoom, size.x - 8);
     const float height = std::min(48 * zoom + counts[page] * (row + 4 * zoom) +
-                                  (page == 0 ? 0 : 80 * zoom), size.y - row - 12);
+                                  (page == 0 ? 0 : 90 * zoom), size.y - row - 12);
     const auto bounds = nk_rect(std::clamp(tab_x[page], 4.0f, size.x - width - 4),
                                 row + 10 * zoom, width, height);
     char name[16]; std::snprintf(name, sizeof(name), "drop%d", page);
@@ -395,74 +505,83 @@ void Render()
             resume |= action("Resume", 0);
             quit |= action("Quit game", 1);
         } else if (page == 1) {
-            fullscreen |= option("Window mode", snapshot.twin_mode ? "Arcade pair" :
+            const auto& r = snapshot.rendering;
+            int direction;
+            fullscreen |= option("Window mode", snapshot.twin_mode ? "Arcade pair (Borderless)" :
                                   snapshot.fullscreen ? "Fullscreen" : "Windowed", 0, !snapshot.twin_mode);
-            start_twin |= option("Twin arcade screens", snapshot.twin_mode ? "On" :
+            start_twin |= option("Twin arcade screens", snapshot.twin_mode ? "Linked (Active)" :
                                  snapshot.twin_supported ? "Start twin screens" : "Unavailable", 1,
                                  !snapshot.twin_mode && snapshot.twin_supported);
+            if (option("Linked cabinet at boot", snapshot.twin_default ? "On" : "Off",
+                       2, snapshot.twin_supported))
+                twin_default_toggle = true;
+            const char* size_names[] = {"Fit window", "960x720", "1280x960", "1920x1440"};
+            if ((direction = option("Display size", size_names[std::clamp(r.display_size, 0, 3)],
+                                    3, r.ready && !snapshot.twin_mode)))
+                change(rendering::Option::DisplaySize, direction);
+            const char* aspect_names[] = {"4:3 (Cabinet)", "16:9 (Widescreen)", "Stretch fill"};
+            if ((direction = option("Aspect ratio", aspect_names[std::clamp(r.aspect, 0, 2)],
+                                    4, r.ready)))
+                change(rendering::Option::Widescreen, direction);
+            char scale[32]; std::snprintf(scale, sizeof(scale), "%dx native", r.resolution);
+            if ((direction = option("Resolution scale", scale, 5, r.ready)))
+                change(rendering::Option::Resolution, direction);
+            const char* dlss_modes[] = {"Off", "Quality", "Balanced", "Performance"};
+            if ((direction = option("NVIDIA DLSS", r.dlss_supported ?
+                                    dlss_modes[std::clamp(r.dlss, 0, 3)] : "Unsupported GPU",
+                                    6, r.ready && r.dlss_supported)))
+                change(rendering::Option::DLSS, direction);
+            const char* fs_names[] = {"Off (60 fps)", "1/2 (30 fps)", "1/3 (20 fps)", "1/4 (15 fps)"};
+            if ((direction = option("Frame skip", fs_names[std::clamp(r.frame_skip, 0, 3)], 7, r.ready)))
+                change(rendering::Option::FrameSkip, direction);
+            if ((direction = option("VSync", r.vsync ? "On" : "Off", 8, r.ready)))
+                change(rendering::Option::VSync, direction);
             const char* border_modes[] = {"Off", "Auto detect", "On"};
-            int direction;
-            if ((direction = option("Sinden white border", border_modes[std::clamp(snapshot.rendering.sinden_border,0,2)],
-                                    2,snapshot.rendering.ready)))
-                change(rendering::Option::SindenBorder,direction);
-            char border_width[24]; std::snprintf(border_width,sizeof(border_width),"%d%%",snapshot.rendering.border_width);
-            if ((direction = option("Border width",border_width,3,snapshot.rendering.ready)))
-                change(rendering::Option::BorderWidth,direction);
-            char devices[96]; std::snprintf(devices,sizeof(devices),"Sinden USB devices: %d (driver must run separately)",snapshot.sinden_devices);
-            nk_layout_row_dynamic(&context,row,1); nk_label(&context,devices,NK_TEXT_LEFT);
-            note = snapshot.twin_mode ? "Linked left and right cabinets. The menu pauses both screens." :
-                   snapshot.twin_supported ? "Start twin screens restarts into the linked arcade pair." :
-                   "Linked cabinet support has not been implemented for this game.";
-            if (selected >= 2) note = "Auto detects Sinden USB hardware. A border surrounds each game view. Install and start the official Linux driver separately.";
-        } else if (page == 4) {
-            for (int i=0; i<8; ++i) if (action(cabinet_labels[i],i)) cabinet_action=i;
-            note = "Controls the original cabinet test system on this screen. Each action resumes the game; F10 reopens this menu. Use the original gun, sound and link tests for maintenance.";
-        } else {
-            const auto& r = snapshot.rendering;
-            const char* detail = "";
-            const int offset = page == 2 ? 2 : 4;
-            int direction;
-            if (page == 2) {
-                if ((direction = option("VSync", r.vsync ? "On" : "Off", 0, r.ready)))
-                    change(rendering::Option::VSync, direction);
-                char queue[32]; std::snprintf(queue, sizeof(queue), "%d frame%s", r.queue_depth,
-                                              r.queue_depth == 1 ? "" : "s");
-                if ((direction = option("Presentation queue", queue, 1, r.ready)))
-                    change(rendering::Option::QueueDepth, direction);
-                detail = selected == 0 ? "Synchronize presentation to the display refresh." :
-                         "Lower queues reduce latency; larger queues allow more overlap.";
-            } else {
-                char scale[32]; std::snprintf(scale, sizeof(scale), "%dx native", r.resolution);
-                if ((direction = option("Internal resolution", scale, 0, r.ready)))
-                    change(rendering::Option::Resolution, direction);
-                if ((direction = option("FXAA", r.fxaa ? "On" : "Off", 1, r.ready)))
-                    change(rendering::Option::FXAA, direction);
-                const char* modes[] = {"Off", "Sharpen", "Sharpen + resize"};
-                if ((direction = option("CAS sharpening", modes[std::clamp(r.cas, 0, 2)], 2,
-                                        r.ready && r.cas_supported)))
-                    change(rendering::Option::CAS, direction);
-                char sharp[32]; std::snprintf(sharp, sizeof(sharp), "%d%%", r.sharpness);
-                if ((direction = option("Sharpness", sharp, 3, r.ready && r.cas_supported && r.cas != 0)))
-                    change(rendering::Option::Sharpness, direction);
-                const char* notes[] = {"Updates the scene briefly at the new resolution, then pauses again.",
-                    "Smooth edges with the active Vulkan FXAA pass.",
-                    "Contrast Adaptive Sharpening; resize mode also scales the final image.",
-                    "Adjust CAS strength. Enable CAS sharpening first."};
-                detail = selected >= 0 && selected < 4 ? notes[selected] :
-                         "Changes preview immediately on both screens and are saved automatically.";
+            if ((direction = option("Sinden white border", border_modes[std::clamp(r.sinden_border, 0, 2)],
+                                    9, r.ready)))
+                change(rendering::Option::SindenBorder, direction);
+            char border_width[24]; std::snprintf(border_width, sizeof(border_width), "%d%%", r.border_width);
+            if ((direction = option("Border width", border_width, 10, r.ready)))
+                change(rendering::Option::BorderWidth, direction);
+            note = "Display & rendering settings apply immediately across both linked cabinet screens.";
+            if (selected == 2) note = "Boot as a linked left/right cabinet pair by default, like the arcade machine.";
+            else if (selected == 3) note = "Fixed window resolution when running single-screen windowed, or Fit to fill.";
+            else if (selected == 4) note = "4:3 original arcade aspect, 16:9 widescreen, or full-panel stretch.";
+            else if (selected == 5) note = "Internal 3D rendering multiplier (1x = native PS2/System 256, 4x = 4K-class).";
+            else if (selected == 6) note = r.dlss_supported ? "NVIDIA RTX GPU detected; selects the DLSS upscaler preset."
+                                                            : "Requires a compatible NVIDIA RTX GPU.";
+            else if (selected == 7) note = "Present every Nth frame while keeping full-speed 60 Hz game simulation.";
+            else if (selected >= 9) note = "White reference border for Sinden lightgun camera tracking.";
+        } else if (page == 2) {
+            for (int i = 0; i < service_count; ++i) {
+                const auto& opt = tc3::service::kOptions[i];
+                const int shown = pending[i] != -2 ? pending[i] : snapshot.service_values[i];
+                const char* value = shown >= 0 && shown < opt.num_values ? opt.values[shown] : "?";
+                char label[64];
+                std::snprintf(label, sizeof(label), "%s%s", pending[i] != -2 ? "* " : "", opt.label);
+                int direction;
+                if ((direction = option(label, value, i, true))) {
+                    int& slot = pending[i];
+                    if (slot == -2) slot = snapshot.service_values[i];
+                    slot = ((slot < 0 ? 0 : slot) + direction + opt.num_values) % opt.num_values;
+                }
             }
-            const int first = page == 2 ? 8 : 0;
-            const int last = page == 2 ? 11 : 8;
-            for (int i = first; i < last; ++i) {
-                const auto& cap = rendering::capabilities[i];
-                option(cap.name, "Unavailable", i - first + offset, false);
+            if (service_count) {
+                if (action("Save & Reset Machine", service_count)) service_apply = true;
             }
-            note = selected >= offset ? rendering::capabilities[first + selected - offset].reason : detail;
+            for (int i = 0; i < 2; ++i)
+                if (action(cabinet_labels[i], service_count + has_save + i)) cabinet_action = i;
+            if (snapshot.service_state == 2 || snapshot.service_state == 3)
+                note = snapshot.service_note;
+            else
+                note = snapshot.is_tc4
+                    ? "Writes directly to cabinet EEPROM with a valid TC4 CRC16 checksum and resets both linked screens together so they pick up the same settings."
+                    : "Writes directly to cabinet EEPROM (TST-03A checksum) and resets both linked screens together so they pick up the same settings.";
         }
         if (page != 0) {
-            nk_layout_row_dynamic(&context, 60 * zoom, 1);
+            nk_layout_row_dynamic(&context, 54 * zoom, 1);
             nk_label_wrap(&context, note);
-            if (page == 2 && snapshot.valid) {
+            if (page == 1 && snapshot.valid) {
                 char rate[96];
                 std::snprintf(rate, sizeof(rate), "Game %.2f FPS | Video %.2f Hz | Speed %.1f%%",
                               snapshot.game_fps, snapshot.video_fps, snapshot.speed_percent);
@@ -495,6 +614,17 @@ void Render()
         for (const auto& [option, direction] : changes) option_callback(option, direction);
     if (fullscreen) Dispatch(Action::ToggleFullscreen);
     if (start_twin) Dispatch(Action::StartTwin);
+    if (twin_default_toggle) Dispatch(Action::ToggleTwinDefault);
+    if (service_apply) {
+        int targets[tc3::service::kOptionCount];
+        for (int i = 0; i < tc3::service::kOptionCount; ++i)
+            targets[i] = pending[i] == -2 ? -1 : pending[i];
+        std::function<void(const int*, int)> apply_callback;
+        { std::lock_guard lock(shared.mutex); apply_callback = shared.service_apply_callback; }
+        if (apply_callback) apply_callback(targets, tc3::service::kOptionCount);
+        for (int i = 0; i < tc3::service::kOptionCount; ++i) pending[i] = -2;
+        SetOpen(false);
+    }
     if (cabinet_action >= 0) {
         Dispatch(cabinet_actions[cabinet_action]);
         SetOpen(false);

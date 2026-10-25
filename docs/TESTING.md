@@ -2,7 +2,7 @@
 
 ## Public CI
 
-The GitHub workflow runs eight component tests on Linux, using synthetic fixtures and no game assets. This covers inventory parsing, reference-speed replay acceptance, rendering capability gates and option bounds, USB detection/hotplug and border geometry, local two-process packet delivery, checked original receive-queue contracts, and shared pause/quit/settings. Run the commands in the main README locally. Unix socket creation must be permitted.
+The GitHub workflow runs nine component tests on Linux, using synthetic fixtures and no game assets. This covers inventory parsing, reference-speed replay acceptance, rendering capability gates and option bounds, USB detection/hotplug and border geometry, local two-process packet delivery, checked original receive-queue contracts, and shared pause/quit/settings. Run the commands in the main README locally. Unix socket creation must be permitted.
 
 The replay acceptance tests explicitly reject 40 FPS progression even with 120 presented frames, a freeze hidden by a good average, mismatched initial states/inputs and a run that ends before required stage milestones. These tests validate the checker; they do not prove that the game has passed it.
 

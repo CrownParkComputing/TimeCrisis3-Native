@@ -15,6 +15,7 @@
 #include "pcsx2/Achievements.h"
 #include "pcsx2/Counters.h"
 #include "pcsx2/DEV9/ACJV.h"
+#include "pcsx2/DEV9/ACSRAM.h"
 #include "pcsx2/GS.h"
 #include "pcsx2/GS/Renderers/Common/GSDevice.h"
 #include "pcsx2/GS/Renderers/Common/GSRenderer.h"
@@ -25,9 +26,12 @@
 #include "pcsx2/ImGui/ImGuiFullscreen.h"
 #include "pcsx2/ImGui/ImGuiManager.h"
 #include "pcsx2/Input/InputManager.h"
+#include "pcsx2/IopMem.h"
+#include "pcsx2/Memory.h"
 #include "pcsx2/MTGS.h"
 #include "pcsx2/PerformanceMetrics.h"
 #include "pcsx2/PrecompiledHeader.h"
+#include "pcsx2/SPU2/spu2.h"
 #include "pcsx2/USB/USB.h"
 #include "pcsx2/VMManager.h"
 #include <SDL3/SDL.h>
@@ -38,12 +42,14 @@
 #include <condition_variable>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
 #ifdef TC3_GAME_MENU
 #include "game_menu.h"
+#include "service_options.h"
 #endif
 #include "../runtime/cabinet/control.h"
 namespace {
@@ -56,6 +62,20 @@ bool previewFramesRunning = false; // CPU thread only; bounded resolution refres
 struct CabinetPulse { u16 mask; u32 started; };
 std::vector<CabinetPulse> cabinetPulses; // CPU thread only; release by guest fields.
 void applyCabinetRendering();
+std::atomic<int> appliedDisplaySize{0}, appliedDLSS{0}; // CPU thread writes; GS thread reads.
+bool detectDlssCapable() {
+  // NVIDIA vendor ID on any PCI device means DLSS-capable hardware is present;
+  // the actual upscaler still needs its backend (checked by the menu gate).
+  static const bool detected = [] {
+    for (const auto& entry : std::filesystem::directory_iterator("/sys/bus/pci/devices")) {
+      std::ifstream vendor(entry.path() / "vendor");
+      std::string id;
+      if (vendor >> id && id == "0x10de") return true;
+    }
+    return false;
+  }();
+  return detected;
+}
 std::mutex cpuMutex, uiMutex, statusMutex, windowMutex;
 std::condition_variable cpuWake;
 std::deque<std::function<void()>> cpuTasks, uiTasks;
@@ -70,7 +90,10 @@ tc3::playable::Status status;
 std::atomic<int> logicalWidth{1100}, logicalHeight{770};
 bool menuInitialized = false; // GS thread only.
 std::atomic<bool> renderingReady{false}, casSupported{false};
-std::atomic<bool> twinSupported{false};
+std::atomic<bool> twinSupported{false}, twinDefault{false};
+std::atomic<bool> serviceSupported{false};
+std::atomic<bool> isTc4{false};
+std::atomic<bool> testModeOn{false}; // DIP0 state; also tracked for the OSD
 uint64_t milliseconds() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              Clock::now().time_since_epoch())
@@ -177,13 +200,20 @@ void refreshPausedScene() {
   std::printf("[TC3 preview] Resolution refresh: two video fields from %u\n", g_FrameCount);
   std::fflush(stdout);
 }
+void applyCabinetControl();
+void serviceApplyTick();
 void applyCabinetControl() {
   for (auto it=cabinetPulses.begin();it!=cabinetPulses.end();) {
-    if (u32(g_FrameCount-it->started)>=6) {
+    // A long hold trips the test menu's auto-repeat and counts as multiple
+    // presses; hold just long enough to latch a single edge.
+    if (u32(g_FrameCount-it->started)>=4) {
       ACJV::SetButtonState(0,it->mask,false);
       it=cabinetPulses.erase(it);
     } else ++it;
   }
+#ifdef TC3_GAME_MENU
+  serviceApplyTick();
+#endif
   if (!cabinetControl)
     return;
   if (cabinetControl->quitting()) {
@@ -193,12 +223,241 @@ void applyCabinetControl() {
     return;
   }
   const auto state = VMManager::GetState();
+  // Synchronized EEPROM reload + native game soft-reset across both cabinets
+  // when either cabinet saves service settings in F10 > Cabinet.
+  static std::uint32_t seenResetSeq = cabinetControl->reset_seq();
+  const std::uint32_t curResetSeq = cabinetControl->reset_seq();
+  if (curResetSeq != seenResetSeq && (state == VMState::Running || state == VMState::Paused)) {
+    seenResetSeq = curResetSeq;
+    const bool peerTc4 = tc3::service::is_tc4_sram(ACSRAM::buffer);
+    if (const char* dir = std::getenv("TC3_CABINET_DIR")) {
+      const std::string sharedSram = std::string(dir) + "/shared-sram.bin";
+      if (FILE* f = std::fopen(sharedSram.c_str(), "rb")) {
+        std::fread(ACSRAM::buffer, 1, ACSRAM_MAX_SIZE, f);
+        std::fclose(f);
+        ACSRAM::WriteFile();
+      }
+    }
+    if (peerTc4 && eeMem && std::memcmp(eeMem->Main + 0x00c1e900, "TSF100-2-NA", 11) == 0) {
+      std::memcpy(eeMem->Main + 0x00c1e900, ACSRAM::buffer, 0x616);
+      // Also update the received-peer option shadow (0x00c1df98..0x00c1dfa0)
+      // so the test menu never flashes DIFFERENT SETTING on the first frame.
+      std::memcpy(eeMem->Main + 0x00c1df98, ACSRAM::buffer + 0x610, 4);
+      eeMem->Main[0x00c1df9c] = ACSRAM::buffer[0x032];
+      eeMem->Main[0x00c1df9d] = ACSRAM::buffer[0x033];
+      eeMem->Main[0x00c1df9e] = ACSRAM::buffer[0x034];
+      eeMem->Main[0x00c1df9f] = ACSRAM::buffer[0x030];
+      eeMem->Main[0x00c1dfa0] = ACSRAM::buffer[0x031];
+      // Trigger TC4LOAD's own native soft-reset (0x00346834: mode=2, next=4),
+      // identical to leaving the test menu, so both screens restart the game
+      // loop in lockstep with the new settings without losing the link.
+      const u32 mode2 = 2, next4 = 4, zero = 0;
+      std::memcpy(eeMem->Main + 0x00c1df10, &zero, 4);
+      std::memcpy(eeMem->Main + 0x005acc10, &mode2, 4);
+      std::memcpy(eeMem->Main + 0x005ac8e8, &next4, 4);
+    } else if (eeMem) {
+      // TC3 ("TST-03A") has no in-game soft-reset trigger; reload its live
+      // EE mirror (which holds the same "TST-03A" block) and reboot the VM.
+      for (size_t off = 0; off + 12 < Ps2MemSize::MainRam; off += 4) {
+        if (std::memcmp(eeMem->Main + off + 4, "TST-03A ", 8) == 0) {
+          std::memcpy(eeMem->Main + off, ACSRAM::buffer, 0x192);
+          std::memcpy(eeMem->Main + off + 0x194, ACSRAM::buffer, 0x192);
+          break;
+        }
+      }
+      if (state == VMState::Paused)
+        VMManager::SetPaused(false);
+      VMManager::Reset();
+    }
+    if (ACJV::GetDIPSwitchState(0))
+      ACJV::ToggleDIPSwitchState(0);
+    testModeOn = false;
+    cabinetControl->set_paused(false);
+    if (state == VMState::Paused)
+      VMManager::SetPaused(false);
+    std::printf("[TC3 service] synchronized cabinet reset (seq=%u)\n", curResetSeq);
+    std::fflush(stdout);
+    return;
+  }
   if (previewFramesRunning && state != VMState::Running)
     previewFramesRunning = false;
   if (!previewFramesRunning && (state == VMState::Running || state == VMState::Paused) &&
       (state == VMState::Paused) != cabinetControl->paused())
     VMManager::SetPaused(cabinetControl->paused());
+  // One machine, one set of speakers: the supervisor asks one cabinet to
+  // stay silent. Reapplied each field because settings reloads restore the
+  // configured volume.
+  static const bool cabinetMuted = std::getenv("TC3_CABINET_MUTE") != nullptr;
+  if (cabinetMuted && (state == VMState::Running || state == VMState::Paused))
+    SPU2::SetOutputVolume(0);
   applyCabinetRendering();
+}
+#ifdef TC3_GAME_MENU
+// ---------------------------------------------------------------------------
+// Direct EEPROM service-option writer. Writes TC4 option bytes/bitfields
+// directly to ACSRAM::buffer with TC4's exact CRC16 (0x614..0x615) and mirror
+// block (0x640..0xc55), persists sram.bin, and triggers a synchronized reset
+// on both cabinets so they reboot together with the new settings.
+// ---------------------------------------------------------------------------
+namespace svc {
+std::atomic<int> pubState{0};
+char pubNote[128] = {};
+
+int decodeValue(int opt) {
+  return tc3::service::read_option(ACSRAM::buffer, opt);
+}
+
+void finish(int state, const char* note) {
+  {
+    std::lock_guard lock(statusMutex);
+    std::snprintf(pubNote, sizeof(pubNote), "%s", note);
+  }
+  pubState = state;
+  std::printf("[TC3 service] %s\n", note);
+  std::fflush(stdout);
+}
+
+void request(const int* targets, int count) {
+  // Sync live EE shadow (0x00c1e900) into ACSRAM::buffer first if valid so we
+  // preserve write counters/bookkeeping before applying the edited options.
+  if (eeMem && std::memcmp(eeMem->Main + 0x00c1e900, "TSF100-2-NA", 11) == 0)
+    std::memcpy(ACSRAM::buffer, eeMem->Main + 0x00c1e900, 0x616);
+
+  tc3::service::write_options_and_commit(ACSRAM::buffer, targets, count);
+
+  // Update the live EE shadow too so the game's 1Hz marshal cannot clobber
+  // ACSRAM::buffer before the reset lands.
+  if (eeMem && std::memcmp(eeMem->Main + 0x00c1e900, "TSF100-2-NA", 11) == 0)
+    std::memcpy(eeMem->Main + 0x00c1e900, ACSRAM::buffer, 0x616);
+
+  ACSRAM::WriteFile();
+
+  if (const char* dir = std::getenv("TC3_CABINET_DIR")) {
+    const std::string sharedSram = std::string(dir) + "/shared-sram.bin";
+    if (FILE* f = std::fopen(sharedSram.c_str(), "wb")) {
+      std::fwrite(ACSRAM::buffer, 1, ACSRAM_MAX_SIZE, f);
+      std::fclose(f);
+    }
+  }
+
+  finish(2, "Settings saved to EEPROM; resetting machine...");
+
+  if (cabinetControl) {
+    if (ACJV::GetDIPSwitchState(0)) {
+      ACJV::ToggleDIPSwitchState(0);
+      cabinetControl->set_test_desired(false);
+    }
+    testModeOn = false;
+    cabinetControl->set_paused(false);
+    cabinetControl->request_reset();
+  } else {
+    if (ACJV::GetDIPSwitchState(0))
+      ACJV::ToggleDIPSwitchState(0);
+    testModeOn = false;
+    if (tc3::service::is_tc4_sram(ACSRAM::buffer) && eeMem &&
+        std::memcmp(eeMem->Main + 0x00c1e900, "TSF100-2-NA", 11) == 0) {
+      const u32 mode2 = 2, next4 = 4, zero = 0;
+      std::memcpy(eeMem->Main + 0x00c1df10, &zero, 4);
+      std::memcpy(eeMem->Main + 0x005acc10, &mode2, 4);
+      std::memcpy(eeMem->Main + 0x005ac8e8, &next4, 4);
+    } else if (VMManager::HasValidVM()) {
+      VMManager::Reset();
+    }
+    if (VMManager::GetState() == VMState::Paused)
+      VMManager::SetPaused(false);
+  }
+}
+} // namespace svc
+void serviceApplyTick() {}
+#endif
+void scanSettingsShadow() {
+  static const bool enabled = std::getenv("TC3_SETTINGS_SCAN") != nullptr;
+  static u64 next = 1500;
+  if (enabled && g_FrameCount >= next) {
+    next = g_FrameCount + 600;
+    static const u8 sig[] = "TSF100-2-NA";
+  auto scan = [&](const u8* mem, size_t size, const char* name) {
+    for (size_t i = 0; i + sizeof(sig) - 1 <= size; i++)
+      if (!std::memcmp(mem + i, sig, sizeof(sig) - 1)) {
+        std::printf("[TC3 scan] %s hit at +0x%zx:", name, i);
+        for (size_t j = 0; j < 0x40; j++)
+          std::printf("%02x", mem[i + j]);
+        std::printf(" | opts:");
+        for (size_t j = 0x30; j < 0x40; j++)
+          std::printf("%02x", mem[i + j]);
+        std::printf(" | ctr:%02x%02x ck:%02x%02x | mir:%02x%02x%02x\n",
+                    mem[i + 0x60], mem[i + 0x61], mem[i + 0x614],
+                    mem[i + 0x615], mem[i + 0x670], mem[i + 0x671],
+                    mem[i + 0x672]);
+      }
+  };
+    if (eeMem)
+      scan(eeMem->Main, Ps2MemSize::MainRam, "eeMem");
+    if (iopMem)
+      scan(iopMem->Main, Ps2MemSize::ExposedIopRam, "iopMem");
+  }
+  // Debug command channel: /tmp/tc3cmd lines "dump <path>" | "poke <eeoff> <off> <val>"
+  if (FILE* cf = std::fopen("/tmp/tc3cmd", "r")) {
+    char line[256];
+    while (std::fgets(line, sizeof(line), cf)) {
+      if (!std::strncmp(line, "dump ", 5)) {
+        char path[200] = {};
+        if (std::sscanf(line + 5, "%199s", path) == 1 && eeMem) {
+          if (FILE* f = std::fopen(path, "wb")) {
+            std::fwrite(eeMem->Main, 1, Ps2MemSize::MainRam, f);
+            std::fclose(f);
+            std::printf("[TC3 dump] eeMem -> %s\n", path);
+          }
+        }
+      } else if (!std::strncmp(line, "poke ", 5)) {
+        unsigned eeoff, val;
+        if (std::sscanf(line + 5, "%x %x", &eeoff, &val) == 2 && eeMem &&
+            eeoff < Ps2MemSize::MainRam) {
+          eeMem->Main[eeoff] = val & 0xff;
+          std::printf("[TC3 poke] eeMem+%x=%02x\n", eeoff, val & 0xff);
+        }
+      } else if (!std::strncmp(line, "dip ", 4)) {
+        unsigned idx;
+        if (std::sscanf(line + 4, "%x", &idx) == 1) {
+          ACJV::ToggleDIPSwitchState(idx);
+          if (idx == 0) testModeOn = ACJV::GetDIPSwitchState(0);
+          std::printf("[TC3 dip] toggle %u state=%d\n", idx,
+                      ACJV::GetDIPSwitchState(idx));
+        }
+      } else if (!std::strncmp(line, "snap", 4)) {
+        tc3::playable::RequestScreenshot();
+      } else if (!std::strncmp(line, "menu ", 5)) {
+#ifdef TC3_GAME_MENU
+        int open;
+        if (std::sscanf(line + 5, "%d", &open) == 1)
+          tc3::menu::SetOpen(open != 0);
+#endif
+      } else if (!std::strncmp(line, "apply ", 6)) {
+#ifdef TC3_GAME_MENU
+        // apply <target0> <target1> ... — service-option indices, -1 skips.
+        int targets[tc3::service::kOptionCount], n = 0, off = 6, v;
+        std::fill(std::begin(targets), std::end(targets), -1);
+        while (n < tc3::service::kOptionCount &&
+               std::sscanf(line + off, "%d", &v) == 1) {
+          targets[n++] = v;
+          while (line[off] && line[off] != ' ') off++;
+          while (line[off] == ' ') off++;
+        }
+        svc::request(targets, n);
+#endif
+      } else if (!std::strncmp(line, "jvs ", 4)) {
+        unsigned mask;
+        if (std::sscanf(line + 4, "%x", &mask) == 1) {
+          ACJV::SetButtonState(0, mask & 0xffff, true);
+          cabinetPulses.push_back({static_cast<u16>(mask), g_FrameCount});
+          std::printf("[TC3 jvs] pulse mask=%04x\n", mask & 0xffff);
+        }
+      }
+    }
+    std::fclose(cf);
+    std::remove("/tmp/tc3cmd");
+  }
+  std::fflush(stdout);
 }
 void telemetry() {
   static uint64_t last = 0;
@@ -206,6 +465,7 @@ void telemetry() {
   if (now - last < 1000)
     return;
   last = now;
+  scanSettingsShadow();
   std::lock_guard lock(statusMutex);
   std::printf("[TC3 telemetry] guest_fields=%u present_calls=%llu "
               "video_fps=%.2f game_fps=%.2f "
@@ -325,7 +585,7 @@ void Host::BeginPresentFrame() {
     MTGS::SetRunIdle(true);
     menuInitialized = true;
   }
-  const auto snapshot = tc3::playable::GetStatus();
+  auto snapshot = tc3::playable::GetStatus();
   tc3::rendering::Options options;
   options.ready = g_gs_device != nullptr;
   options.cas_supported = options.ready && g_gs_device->Features().cas_sharpening;
@@ -337,14 +597,106 @@ void Host::BeginPresentFrame() {
   options.queue_depth = GSConfig.VsyncQueueSize;
   options.sinden_border = tc3::sinden::mode.load();
   options.border_width = tc3::sinden::width_percent.load();
+  options.aspect = GSConfig.AspectRatio == AspectRatioType::R16_9 ? 1 :
+                   GSConfig.AspectRatio == AspectRatioType::Stretch ? 2 : 0;
+  options.display_size = appliedDisplaySize.load();
+  options.frame_skip = GSConfig.FrameSkip;
+  options.dlss_supported = detectDlssCapable();
+  options.dlss = appliedDLSS.load();
   renderingReady = options.ready;
   casSupported = options.cas_supported;
-  tc3::menu::PublishSnapshot({snapshot.game_fps, snapshot.video_fps,
-                              snapshot.running, snapshot.fullscreen,
-                              float(logicalWidth.load()),
-                              float(logicalHeight.load()), options,
-                              snapshot.speed_percent, cabinetControl != nullptr,
-                              twinSupported.load(), tc3::sinden::detected.load()});
+  tc3::menu::Snapshot ms{snapshot.game_fps, snapshot.video_fps,
+                       snapshot.running, snapshot.fullscreen,
+                       float(logicalWidth.load()),
+                       float(logicalHeight.load()), options,
+                       snapshot.speed_percent, cabinetControl != nullptr,
+                       twinSupported.load()};
+  ms.twin_default = twinDefault.load();
+  ms.sinden_devices = tc3::sinden::detected.load();
+  ms.service_supported = serviceSupported.load();
+  ms.is_tc4 = isTc4.load();
+  ms.service_state = svc::pubState.load();
+  {
+    std::lock_guard lock(statusMutex);
+    std::snprintf(ms.service_note, sizeof(ms.service_note), "%s", svc::pubNote);
+  }
+  if (serviceSupported)
+    for (int i = 0; i < tc3::service::kOptionCount && i < 8; ++i)
+      ms.service_values[i] = svc::decodeValue(i);
+  // Keep test mode paired across both cabinets: publish local DIP changes
+  // and chase the twin's published state so F9 on one screen enters and
+  // exits the test menu on both machines together.
+  bool dipState = ACJV::GetDIPSwitchState(0);
+  if (cabinetControl) {
+    static std::uint32_t seenSeq = 0;
+    static bool knownDip = false;
+    const std::uint32_t seq = cabinetControl->test_seq();
+    const bool desired = cabinetControl->test_desired();
+    if (seq != seenSeq) {
+      seenSeq = seq;
+      if (desired != dipState) {
+        ACJV::ToggleDIPSwitchState(0);
+        dipState = !dipState;
+      }
+      knownDip = dipState;
+    } else if (dipState != knownDip) {
+      cabinetControl->set_test_desired(dipState);
+      seenSeq = cabinetControl->test_seq();
+      knownDip = dipState;
+    }
+  }
+  ms.test_mode = dipState;
+  // Show the loading screen only until the game starts displaying frames
+  // (snapshot.game_fps >= 0.5), and report the real live boot stage as it
+  // progresses through dongle boot -> IOP modules -> HDD load -> JVS/link init.
+  ms.loading = !dipState && (snapshot.game_fps < 0.5);
+  if (ms.loading) {
+    const bool tc4 = isTc4.load();
+    u32 tc4Code = 0, tc4LinkInit = 0;
+    if (tc4 && eeMem) {
+      std::memcpy(&tc4Code, eeMem->Main + 0x00362bf0, 4);
+      std::memcpy(&tc4LinkInit, eeMem->Main + 0x00c1fb40, 4);
+    }
+    if (g_FrameCount == 0) {
+      ms.load_progress = 0.12f;
+      std::snprintf(ms.load_stage, sizeof(ms.load_stage),
+                    tc4 ? "Starting System 256 VM & Vulkan renderer..."
+                        : "Starting System 246 VM & Vulkan renderer...");
+    } else if (!ACJV::enabled) {
+      ms.load_progress = 0.30f;
+      std::snprintf(ms.load_stage, sizeof(ms.load_stage),
+                    "Booting security dongle (proverb.elf) & IOP kernel... [field %u]",
+                    g_FrameCount);
+    } else if (tc4 && tc4Code == 0) {
+      ms.load_progress = 0.55f;
+      std::snprintf(ms.load_stage, sizeof(ms.load_stage),
+                    "Mounting HDD image & loading IOP modules (ACJV / ACSRAM / ATAD)... [field %u]",
+                    g_FrameCount);
+    } else if (tc4 && tc4LinkInit == 0) {
+      ms.load_progress = 0.80f;
+      std::snprintf(ms.load_stage, sizeof(ms.load_stage),
+                    "Loading TC4LOAD game binary from HDD... [field %u]",
+                    g_FrameCount);
+    } else if (!tc4) {
+      ms.load_progress = 0.72f;
+      std::snprintf(ms.load_stage, sizeof(ms.load_stage),
+                    "Loading TST game program from DVD media & initializing NA-JV I/O + ILSOCK link... [field %u]",
+                    g_FrameCount);
+    } else {
+      ms.load_progress = 0.95f;
+      std::snprintf(ms.load_stage, sizeof(ms.load_stage),
+                    "Initializing NA-JV I/O board & twin-cabinet link... [field %u]",
+                    g_FrameCount);
+    }
+  } else {
+    ms.load_progress = 1.0f;
+  }
+  static const int role = [] {
+    const char* r = std::getenv("TC3_CABINET_ROLE");
+    return r ? (r[0] == 'l' ? 0 : 1) : -1;
+  }();
+  ms.cabinet_role = role;
+  tc3::menu::PublishSnapshot(ms);
   // Record applied GS values, rather than just the menu's requested values.
   static tc3::rendering::Options previous;
   if (!previous.ready || previous.resolution != options.resolution ||
@@ -379,7 +731,28 @@ void Host::OnVMStarted() {
     std::lock_guard lock(statusMutex);
     status.running = true;
   }
+  // Leaving the test menu reboots the VM with the dip still set, which
+  // would boot straight back into test mode. Only the first boot honours a
+  // persisted test-mode dip; a reboot clears it so the machine lands in the
+  // game, and the published state drags the twin out with it.
+  static bool bootedOnce = false;
+  if (bootedOnce && ACJV::GetDIPSwitchState(0)) {
+    ACJV::ToggleDIPSwitchState(0);
+    if (cabinetControl)
+      cabinetControl->set_test_desired(false);
+  }
+  bootedOnce = true;
   report("VM", "Boot succeeded", false);
+  // The arcade cabinet ships linked: unless the user turned the pair off,
+  // hand this instance over to the cabinet supervisor once the first VM has
+  // proven it can boot. Workers re-enter with TC3_CABINET_ROLE and skip this.
+  static bool twinHandoff = false;
+  if (!twinHandoff && twinDefault && twinSupported && !cabinetControl) {
+    twinHandoff = true;
+    report("Twin screens", "Linked cabinet pair enabled by default; use "
+           "F10 > Display > Linked cabinet at boot to disable", false);
+    tc3::playable::RequestTwinScreens();
+  }
 }
 
 void Host::OnVMDestroyed() {
@@ -639,13 +1012,17 @@ void RequestScreenshot() {
       MTGS::RunOnGSThread([] { GSQueueSnapshot(""); });
   });
 }
+std::string bootDataRoot, bootManifest; // UI thread only; set once in main().
 void RequestTwinScreens() {
   if (!twinSupported) return;
   ui([] {
     const auto launcher = std::filesystem::path(__FILE__).parent_path().parent_path() /
                           "tools/run_cabinet_pair.py";
     const auto path = launcher.string();
-    const char* arguments[] = {"python3", path.c_str(), "--background", nullptr};
+    const auto source = bootDataRoot, manifest = bootManifest;
+    const char* arguments[] = {"python3", path.c_str(), "--background",
+                               "--source", source.c_str(),
+                               "--manifest", manifest.c_str(), nullptr};
     SDL_Process* process = SDL_CreateProcess(arguments, false);
     if (!process) {
       report("Twin screens", SDL_GetError(), true);
@@ -662,11 +1039,17 @@ void RequestTwinScreens() {
   });
 }
 #ifdef TC3_GAME_MENU
+void RequestServiceApply(const int* targets, int count) {
+  Host::RunOnCPUThread([snapshot = std::vector<int>(targets, targets + count)] {
+    if (!VMManager::HasValidVM()) return;
+    svc::request(snapshot.data(), int(snapshot.size()));
+  });
+}
 void RequestCabinetAction(tc3::menu::Action action) {
   Host::RunOnCPUThread([action] {
     if (!VMManager::HasValidVM()) return;
     using A=tc3::menu::Action;
-    if (action==A::CabinetTest) ACJV::ToggleDIPSwitchState(0);
+    if (action==A::CabinetTest) { ACJV::ToggleDIPSwitchState(0); testModeOn = ACJV::GetDIPSwitchState(0); }
     else if (action==A::CabinetCoin) ACJV::InsertCoin(0);
     else {
       u16 mask=0;
@@ -675,7 +1058,7 @@ void RequestCabinetAction(tc3::menu::Action action) {
       case A::CabinetDown: mask=JVS_BTN_DOWN;break;
       case A::CabinetLeft: mask=JVS_BTN_LEFT;break;
       case A::CabinetRight: mask=JVS_BTN_RIGHT;break;
-      case A::CabinetEnter: mask=JVS_BTN_1;break;
+      case A::CabinetEnter: mask=ACJV::GetMode()==JVS_MODE::DRIVE ? JVS_BTN_START : JVS_BTN_1;break;
       case A::CabinetService: mask=JVS_BTN_SERVICE;break;
       default: return;
       }
@@ -705,6 +1088,14 @@ void RequestRenderingOption(tc3::rendering::Option option, int direction) {
       current.queue_depth = settings->GetIntValue("EmuCore/GS", "VsyncQueueSize", 2);
       current.sinden_border = tc3::sinden::mode.load();
       current.border_width = tc3::sinden::width_percent.load();
+      {
+        const std::string ar = settings->GetStringValue("EmuCore/GS", "AspectRatio", "4:3");
+        current.aspect = ar == "16:9" ? 1 : ar == "Stretch" ? 2 : 0;
+      }
+      current.display_size = settings->GetIntValue("UI", "DisplaySize", 0);
+      current.frame_skip = settings->GetIntValue("EmuCore/GS", "FrameSkip", 0);
+      current.dlss = settings->GetIntValue("TC3", "DLSSMode", 0);
+      current.dlss_supported = detectDlssCapable();
       value = tc3::rendering::adjust(current, option, direction);
       resolution_changed = value.resolution != current.resolution;
       switch (option) {
@@ -726,7 +1117,25 @@ void RequestRenderingOption(tc3::rendering::Option option, int direction) {
         settings->SetBoolValue("EmuCore/GS", "VsyncEnable", value.vsync); break;
       case tc3::rendering::Option::QueueDepth:
         settings->SetIntValue("EmuCore/GS", "VsyncQueueSize", value.queue_depth); break;
+      case tc3::rendering::Option::Widescreen: {
+        static const char* aspect_names[] = {"4:3", "16:9", "Stretch"};
+        settings->SetStringValue("EmuCore/GS", "AspectRatio", aspect_names[value.aspect]);
+        break;
       }
+      case tc3::rendering::Option::DisplaySize:
+        settings->SetIntValue("UI", "DisplaySize", value.display_size);
+        appliedDisplaySize = value.display_size; break;
+      case tc3::rendering::Option::FrameSkip:
+        settings->SetIntValue("EmuCore/GS", "FrameSkip", value.frame_skip); break;
+      case tc3::rendering::Option::DLSS:
+        settings->SetIntValue("TC3", "DLSSMode", value.dlss);
+        appliedDLSS = value.dlss; break;
+      }
+    }
+    if (option == tc3::rendering::Option::DisplaySize && value.display_size > 0 && !cabinetControl) {
+      static const int display_sizes[][2] = {{0, 0}, {960, 720}, {1280, 960}, {1920, 1440}};
+      Host::RequestResizeHostDisplay(display_sizes[value.display_size][0],
+                                   display_sizes[value.display_size][1]);
     }
     // ApplySettings takes the settings lock itself and synchronizes GS updates.
     VMManager::ApplySettings();
@@ -763,6 +1172,15 @@ void applyCabinetRendering() {
     settings->SetIntValue("EmuCore/GS", "VsyncQueueSize", value->queue_depth);
     settings->SetIntValue("Lightgun", "SindenBorder", value->sinden_border);
     settings->SetIntValue("Lightgun", "BorderWidth", value->border_width);
+    {
+      static const char* aspect_names[] = {"4:3", "16:9", "Stretch"};
+      settings->SetStringValue("EmuCore/GS", "AspectRatio", aspect_names[value->aspect]);
+    }
+    settings->SetIntValue("UI", "DisplaySize", value->display_size);
+    settings->SetIntValue("EmuCore/GS", "FrameSkip", value->frame_skip);
+    settings->SetIntValue("TC3", "DLSSMode", value->dlss);
+    appliedDisplaySize = value->display_size;
+    appliedDLSS = value->dlss;
     tc3::sinden::mode = value->sinden_border;
     tc3::sinden::width_percent = value->border_width;
   }
@@ -806,6 +1224,8 @@ void initializeSettings(const std::string &root) {
     settings->SetBoolValue("EmuCore/GS", key, false);
   settings->SetIntValue("EmuCore/GS", "OsdMessagesPos", 0);
   settings->SetIntValue("EmuCore/GS", "OsdPerformancePos", 0);
+  appliedDisplaySize = settings->GetIntValue("UI", "DisplaySize", 0);
+  appliedDLSS = settings->GetIntValue("TC3", "DLSSMode", 0);
   if (const char* role = std::getenv("TC3_CABINET_ROLE")) {
     const std::string_view side(role);
     if (side != "left" && side != "right")
@@ -977,9 +1397,18 @@ int main(int argc, char **argv) {
       throw std::runtime_error(hardwareError ? hardwareError
                                              : "Unsupported CPU");
     initializeSettings(dataRoot);
+    tc3::playable::bootDataRoot = std::filesystem::absolute(dataRoot).string();
+    tc3::playable::bootManifest = std::filesystem::absolute(manifest).string();
     INISettingsInterface gameManifest(std::filesystem::absolute(manifest).string());
     if (!gameManifest.Load()) throw std::runtime_error("Cannot read arcade game manifest");
-    twinSupported = gameManifest.GetStringValue("game", "gameid", "") == "NM00012";
+    const std::string gameId = gameManifest.GetStringValue("game", "gameid", "");
+    twinSupported = gameId == "NM00012" || gameId == "NM00032";
+    serviceSupported = twinSupported.load();
+    isTc4 = gameId == "NM00032";
+    // The arcade cabinet ships linked; keep the pair on by default. The menu
+    // can turn it off; the choice is persisted under the INI key below.
+    twinDefault = twinSupported.load() &&
+                  settings->GetBoolValue("TC3", "LinkedCabinet", true);
     tc3::sinden::mode = std::clamp(settings->GetIntValue("Lightgun", "SindenBorder", 1),0,2);
     tc3::sinden::width_percent = std::clamp(settings->GetIntValue("Lightgun", "BorderWidth", 2),1,5);
     if (const char* role = std::getenv("TC3_CABINET_ROLE")) {
@@ -999,8 +1428,33 @@ int main(int argc, char **argv) {
                                   SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!window)
       throw std::runtime_error(SDL_GetError());
-    if (const char* role = std::getenv("TC3_CABINET_ROLE"))
-      SDL_SetWindowTitle(window, std::string("Time Crisis 3 — ").append(role).c_str());
+    if (const char* role = std::getenv("TC3_CABINET_ROLE")) {
+      SDL_SetWindowTitle(window, std::string(gameName).append(" — ").append(role).c_str());
+      // One machine, two flush screens: undecorated and pinned to this
+      // worker's share of the combined display. With two monitors each gets
+      // a real fullscreen screen; on a single display the pair tiles as
+      // borderless halves with no gap between them.
+      const bool right = std::string_view(role) == "right";
+      int count = 0;
+      SDL_DisplayID* displays = SDL_GetDisplays(&count);
+      SDL_SetWindowBordered(window, false);
+      if (displays && count >= 2) {
+        SDL_Rect bounds{};
+        SDL_GetDisplayBounds(displays[right ? 1 : 0], &bounds);
+        SDL_SetWindowPosition(window, bounds.x, bounds.y);
+        SDL_SetWindowSize(window, bounds.w, bounds.h);
+        SDL_SetWindowFullscreen(window, true);
+      } else {
+        SDL_Rect bounds{};
+        SDL_GetDisplayUsableBounds(displays ? displays[0] : SDL_GetPrimaryDisplay(),
+                                   &bounds);
+        bounds.w /= 2;
+        if (right) bounds.x += bounds.w;
+        SDL_SetWindowPosition(window, bounds.x, bounds.y);
+        SDL_SetWindowSize(window, bounds.w, bounds.h);
+      }
+      SDL_free(displays);
+    }
     updateWindow();
     VMBootParameters params;
     params.filename = std::filesystem::absolute(manifest).string();
@@ -1027,12 +1481,23 @@ int main(int argc, char **argv) {
       case tc3::menu::Action::StartTwin:
         tc3::playable::RequestTwinScreens();
         break;
+      case tc3::menu::Action::ToggleTwinDefault:
+        // Persisted default; takes effect on next launch.
+        Host::RunOnCPUThread([] {
+          auto lock = Host::GetSettingsLock();
+          const bool next = !twinDefault.load();
+          settings->SetBoolValue("TC3", "LinkedCabinet", next);
+          twinDefault = next;
+          Host::CommitBaseSettingChanges();
+        });
+        break;
       default:
         tc3::playable::RequestCabinetAction(action);
         break;
       }
     });
     tc3::menu::SetOptionCallback(tc3::playable::RequestRenderingOption);
+    tc3::menu::SetServiceApplyCallback(tc3::playable::RequestServiceApply);
 #endif
     cpu = std::thread(cpuMain, std::move(params));
     std::unordered_set<SDL_Keycode> heldKeys;

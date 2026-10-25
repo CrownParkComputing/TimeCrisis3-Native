@@ -49,3 +49,14 @@ packets across two processes, verifies exact envelope bytes and rejects oversize
 or truncated frames. It also checks absent/disconnected peers and duplicate
 endpoint ownership. The guest queue test verifies port/GUID filtering, payload
 placement, deferred wake metadata, and full/exhausted/corrupt queue behavior.
+
+## Additional checked module revision
+
+The shared bridge also recognizes the Ridge Racer V RRV3/A ILSOCK 2.2 export and
+receive-loop profile. Its globals are shifted by 0xa0 and its wait return is
+0x2240. Queue descriptor and wire layout are preserved; receive maximum remains
+the value set by that original guest (288 bytes for Ridge). A separate profile
+regression rejects cross-revision guards and tests both receive layouts. This
+recognition does not establish linked Ridge races; title runtime proof is kept
+in the separate RidgeRacerV-Native project. TC3's offsets and behavior remain
+covered by the original receive-queue regression.

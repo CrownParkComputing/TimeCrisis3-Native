@@ -23,27 +23,58 @@ from runtime code validation; regression tests cover their observed mutation.
 Each worker has independent SRAM/cards, a separate GS mapping name and its own
 Vulkan output. Opening either Nuklear menu pauses both guests. Rendering changes
 publish one atomic settings transaction to both workers; closing the menu resumes
-both. Quit closes the pair normally. Shared pause ownership avoids resuming the
-other worker while its menu remains open.
+both. Quit closes the pair normally; closing or rebooting one side affects the
+other. Shared pause ownership avoids resuming the other worker while its menu
+remains open. One worker is muted so the pair behaves as a single machine with
+one sound source.
 
-Current presentation uses **two adjacent windows**; a single combined window is
-still outstanding. Complete-stage synchronization, disconnect recovery, paired
-savestates and audio mixing also require further validation. One-sided F1/F3
-save/load is disabled for linked workers. The historical
+Current presentation uses **two adjacent borderless windows** (one fullscreen
+view per display, or tiled halves on a single monitor); a single combined window
+is still outstanding. Complete-stage synchronization, disconnect recovery,
+paired savestates and audio mixing also require further validation. One-sided
+F1/F3 save/load is disabled for linked workers. The historical
 stage-one freeze point has not been cleared by this work.
+
+## Cabinet service options (direct EEPROM)
+
+The original cabinet options no longer require the F9 test menu. F10 →
+Cabinet / Service edits player's life, difficulty, hit color, free play, game
+cost, continue cost and attract sound directly. **Save & Reset Machine** writes
+the `TST-03A` EEPROM block with a valid additive checksum (verified against
+captured cabinet SRAM), mirrors it into the backup region, publishes it to the
+peer worker through the shared control state and resets both machines together.
+Live run verified: setting free play produced `0x10=1` with a valid checksum in
+both cabinets' `sram.bin`, both workers logged `synchronized cabinet reset`,
+and both attract loops displayed `FREE PLAY`. The attract-sound field offset is
+inferred from cabinet SRAM captures (both images held `0x024=1`); it is not yet
+confirmed against the game's own OTHERS page.
 
 ## Rendering and menu
 
-Working controls: internal resolution 1–4x, FXAA, CAS sharpening and strength,
-VSync, and queue depth. Device support gates CAS. These update the real GS/Vulkan
-settings, are saved, and propagate to the second cabinet. Game/video rates and
-speed are visible in the Performance menu; core OSD is disabled.
+The menu is consolidated into File, Display & Rendering, and Cabinet / Service.
+Working controls: window mode, twin launch/default, display size, aspect ratio,
+internal resolution 1–4x, frame skip, VSync and Sinden border mode/width. The
+FXAA/CAS/sharpness controls were removed from the visible page. Device support
+gates CAS internally. DLSS presets are exposed only when a capable GPU is
+detected and are stored settings — an actual DLSS backend is not implemented.
+Rendering settings update the real GS/Vulkan state, are saved, and propagate to
+the second cabinet. Game/video rates and speed are visible live; core OSD is
+disabled.
 
-DLSS, temporal FSR, RCAS, jitter, motion vectors and frame generation remain
-unimplemented. CAS is not advertised as RCAS. The pinned source is preserved;
+DLSS execution, temporal FSR, RCAS, jitter, motion vectors and frame generation
+remain unimplemented. The pinned source is preserved;
 the playable CMake hook generates product-specific copies for patch-loader
 suppression, process-isolated GS allocation, and the IOP transport boundary.
 The external GameDB/PNACH/cheat loader is bypassed.
+
+## Boot presentation
+
+A per-game splash renders while the game boots, reporting the live stage —
+VM/Vulkan start, security dongle and IOP kernel, DVD media and module load,
+then JVS/ILSOCK link initialization — with a progress bar. It clears as soon as
+the guest produces real frames (`game_fps >= 0.5`), and re-arms on the
+synchronized service reset. On a linked pair the standby screen covers the
+secondary display while the original test menu is open.
 
 Paused menu rendering now uses MTGS idle presents. The earlier headless menu
 test missed the live pause lifecycle; live integration checks cover it now.
@@ -55,7 +86,7 @@ do not advance gameplay. Preview resources are released before device teardown.
 
 ## Validation
 
-* Eight public component CTest cases pass: inventory, replay progress, temporal
+* Nine public component CTest cases pass: inventory, replay progress, temporal
   capability gates, rendering bounds/packed control, Sinden detection/geometry,
   two-process packet transport, original receive queues/module guards and shared
   pause/quit/settings. The additional optional scalar semantics proof also passed
@@ -83,6 +114,28 @@ Observed initial gameplay runs near 59.94 FPS/100% at native resolution. Movies
 normally render 29.97 frames/s at 100% speed. Full-stage frame-time distributions,
 camera/aim/audio equivalence and the old freeze point still need matched replays.
 Neither a 60 Hz menu nor generated frames can satisfy the guest-speed gate.
+
+## Native vs emulated split
+
+"Native" means code owned by this project running directly on Linux; "emulated"
+means original PS2/System 246 code executing inside the in-process
+PCSX2-derived compatibility core.
+
+| Layer | Split |
+| --- | --- |
+| Host, UI, input & cabinet layer (SDL3, Nuklear, EEPROM writer, `control.bin` sync, Unix link transport) | ~100% native |
+| Arcade I/O & link hardware (NA-JV JVS, gun scaling, SRAM, ILSOCK/ILDRV transport) | ~100% native HLE |
+| GPU presentation (GS → Vulkan, scaling, widescreen, pacing) | Hybrid: native Vulkan backend driven by the emulated GS stream |
+| Game code & audio (original EE/VU/IOP programs, SPU2 mixing) | Emulated via x86-64 JIT; ~0% statically recompiled |
+
+Approximate subsystem weight: **~45% native host/arcade infrastructure, ~55%
+emulated core**. **0% of the game's own code is statically translated today.**
+
+Path to 100% native: static EE/VU recompilation (PS2Recomp), native IOP module
+contracts (the ILSOCK/ILDRV transport already demonstrates this), a native GS
+renderer fed by the game's draw stream, a native SPU2-class mixer, then
+matched-replay validation for full-stage completion, gun calibration, audio
+equivalence and the stage-one freeze point.
 
 ## Native translation and Android
 

@@ -19,4 +19,6 @@ void RequestFullscreen(bool fullscreen);
 void RequestSaveState();
 void RequestLoadState();
 void RequestScreenshot();
+void RequestTwinScreens();
+void RequestServiceApply(const int* targets, int count);
 } // namespace tc3::playable
