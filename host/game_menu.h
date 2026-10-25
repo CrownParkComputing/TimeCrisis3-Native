@@ -25,6 +25,8 @@ struct Snapshot {
     // Cabinet service options (TC4 game options). -1 = value unknown.
     bool service_supported = false;
     bool is_tc4 = false;  // NM00032 (TSF100) EEPROM format; false = TC3 (TST-03A)
+    bool is_ridge = false;  // NM00001 Ridge V: driving cabinet, tagged-record SRAM
+    bool has_sinden = false;  // lightgun tracking border UI (hidden on driving)
     int service_state = 0;   // 0 idle, 1 working, 2 done, 3 failed
     char service_note[96] = {};
     int service_values[8] = {};

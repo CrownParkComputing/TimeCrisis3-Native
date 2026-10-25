@@ -114,6 +114,10 @@ def main():
     parser.add_argument('--manifest', type=Path,
         help='Boot manifest. With --source this may be inside the cloned root '
              'or a bare filename under its games/ directory.')
+    parser.add_argument('--state-root', type=Path,
+        help='Directory for cabinet clones, logs, pidfile and run report. '
+             'Defaults to this repo\'s .local (used by sibling game launchers '
+             'that point at their own .local instead).')
     args = parser.parse_args()
     if args.seconds is not None and not 1 <= args.seconds <= 86400:
         parser.error('--seconds must be between 1 and 86400')
@@ -124,7 +128,10 @@ def main():
     binary = ROOT / '.local/core-build/bin/tc3-native'
     if not binary.is_file():
         parser.error('Build the playable target first')
-    pidfile = ROOT / '.local/cabinet-supervisor.pid'
+    state = (args.state_root.expanduser().resolve() if args.state_root
+             else ROOT / '.local')
+    state.mkdir(parents=True, exist_ok=True)
+    pidfile = state / 'cabinet-supervisor.pid'
     if pidfile.exists():
         try:
             previous = int(pidfile.read_text())
@@ -141,13 +148,15 @@ def main():
             command += ['--source', str(args.source)]
         if args.manifest is not None:
             command += ['--manifest', str(args.manifest)]
-        with (ROOT / '.local/cabinet-supervisor.log').open('w') as output:
+        if args.state_root is not None:
+            command += ['--state-root', str(args.state_root)]
+        with (state / 'cabinet-supervisor.log').open('w') as output:
             child = subprocess.Popen(command, cwd=ROOT, stdin=subprocess.DEVNULL,
                 stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
         print(f'TC3 twin-cabinet supervisor PID: {child.pid}', flush=True)
         return 0
     pidfile.write_text(str(os.getpid()) + '\n')
-    roots = {role: ROOT / f'.local/cabinet-{role}' for role in ('left', 'right')}
+    roots = {role: state / f'cabinet-{role}' for role in ('left', 'right')}
     for root in roots.values():
         if args.source is not None:
             clone_playtest(args.source, root)
@@ -165,7 +174,7 @@ def main():
     directory = Path(tempfile.mkdtemp(prefix='tc3-link-'))
     (directory / 'control.bin').write_bytes(struct.pack('<6I', 0x54433301, 0, 0, 0, 0, 0))
     report = {'session': str(directory), 'workers': {}, 'linked_gameplay_validated': False}
-    report_path = ROOT / '.local/cabinet-pair-run.json'
+    report_path = state / 'cabinet-pair-run.json'
     workers = []
     outputs = []
     try:
@@ -175,7 +184,7 @@ def main():
             # One machine, one sound output: only the left cabinet talks.
             if role == 'right':
                 env['TC3_CABINET_MUTE'] = '1'
-            log = ROOT / f'.local/cabinet-{role}.log'
+            log = state / f'cabinet-{role}.log'
             output = log.open('w'); outputs.append(output)
             command = [str(binary), '--data-root', str(root),
                 '--boot-manifest', str(root / boot_manifest)]
@@ -203,9 +212,10 @@ def main():
                     monitor = next((m for m in monitors if m.get('focused')), monitors[0])
                     scale = monitor.get('scale', 1)
                     width, height = monitor['width'] / scale, monitor['height'] / scale
-                    subprocess.run(['hyprctl', 'keyword', 'windowrule',
-                                    'border_size 0, match:title Time Crisis'],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                    for title in ('Time Crisis', 'Ridge Racer'):
+                        subprocess.run(['hyprctl', 'keyword', 'windowrule',
+                                        f'border_size 0, match:title {title}'],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
                     clients = json.loads(subprocess.check_output(['hyprctl', 'clients', '-j'], text=True))
                     for index, child in enumerate(workers):
                         client = next((c for c in clients if c['pid'] == child.pid), None)

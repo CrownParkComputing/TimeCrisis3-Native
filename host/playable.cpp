@@ -92,7 +92,7 @@ bool menuInitialized = false; // GS thread only.
 std::atomic<bool> renderingReady{false}, casSupported{false};
 std::atomic<bool> twinSupported{false}, twinDefault{false};
 std::atomic<bool> serviceSupported{false};
-std::atomic<bool> isTc4{false};
+std::atomic<bool> isTc4{false}, isRidge{false};
 std::atomic<bool> testModeOn{false}; // DIP0 state; also tracked for the OSD
 uint64_t milliseconds() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -318,6 +318,14 @@ void finish(int state, const char* note) {
 }
 
 void request(const int* targets, int count) {
+  // Never run the TC3/TC4 block writers against an unrecognized SRAM layout
+  // (e.g. Ridge V's tagged-record EEPROM) — that would corrupt it.
+  if (!tc3::service::is_tc4_sram(ACSRAM::buffer) &&
+      !tc3::service::is_tc3_sram(ACSRAM::buffer) &&
+      !tc3::service::is_ridge_sram(ACSRAM::buffer)) {
+    finish(3, "EEPROM format not recognized; settings not applied.");
+    return;
+  }
   // Sync live EE shadow (0x00c1e900) into ACSRAM::buffer first if valid so we
   // preserve write counters/bookkeeping before applying the edited options.
   if (eeMem && std::memcmp(eeMem->Main + 0x00c1e900, "TSF100-2-NA", 11) == 0)
@@ -435,9 +443,9 @@ void scanSettingsShadow() {
       } else if (!std::strncmp(line, "apply ", 6)) {
 #ifdef TC3_GAME_MENU
         // apply <target0> <target1> ... — service-option indices, -1 skips.
-        int targets[tc3::service::kOptionCount], n = 0, off = 6, v;
+        int targets[tc3::service::kMaxOptionCount], n = 0, off = 6, v;
         std::fill(std::begin(targets), std::end(targets), -1);
-        while (n < tc3::service::kOptionCount &&
+        while (n < tc3::service::kMaxOptionCount &&
                std::sscanf(line + off, "%d", &v) == 1) {
           targets[n++] = v;
           while (line[off] && line[off] != ' ') off++;
@@ -615,14 +623,19 @@ void Host::BeginPresentFrame() {
   ms.sinden_devices = tc3::sinden::detected.load();
   ms.service_supported = serviceSupported.load();
   ms.is_tc4 = isTc4.load();
+  ms.is_ridge = isRidge.load();
+  ms.has_sinden = !isRidge.load();
   ms.service_state = svc::pubState.load();
   {
     std::lock_guard lock(statusMutex);
     std::snprintf(ms.service_note, sizeof(ms.service_note), "%s", svc::pubNote);
   }
-  if (serviceSupported)
-    for (int i = 0; i < tc3::service::kOptionCount && i < 8; ++i)
+  if (serviceSupported) {
+    const int optCount = isRidge.load() ? tc3::service::kRidgeOptionCount
+                                        : tc3::service::kOptionCount;
+    for (int i = 0; i < optCount && i < 8; ++i)
       ms.service_values[i] = svc::decodeValue(i);
+  }
   // Keep test mode paired across both cabinets: publish local DIP changes
   // and chase the twin's published state so F9 on one screen enters and
   // exits the test menu on both machines together.
@@ -676,6 +689,11 @@ void Host::BeginPresentFrame() {
       ms.load_progress = 0.80f;
       std::snprintf(ms.load_stage, sizeof(ms.load_stage),
                     "Loading TC4LOAD game binary from HDD... [field %u]",
+                    g_FrameCount);
+    } else if (isRidge.load()) {
+      ms.load_progress = 0.72f;
+      std::snprintf(ms.load_stage, sizeof(ms.load_stage),
+                    "Loading RRV3 game program from CD media & initializing FCA-1 I/O + ILSOCK link... [field %u]",
                     g_FrameCount);
     } else if (!tc4) {
       ms.load_progress = 0.72f;
@@ -1020,9 +1038,14 @@ void RequestTwinScreens() {
                           "tools/run_cabinet_pair.py";
     const auto path = launcher.string();
     const auto source = bootDataRoot, manifest = bootManifest;
+    // The prepared data root lives under the game repo's .local; supervisor
+    // state (clones, logs, pidfile, report) belongs beside it, not in the
+    // foundation checkout.
+    const auto stateRoot = std::filesystem::path(source).parent_path().string();
     const char* arguments[] = {"python3", path.c_str(), "--background",
                                "--source", source.c_str(),
-                               "--manifest", manifest.c_str(), nullptr};
+                               "--manifest", manifest.c_str(),
+                               "--state-root", stateRoot.c_str(), nullptr};
     SDL_Process* process = SDL_CreateProcess(arguments, false);
     if (!process) {
       report("Twin screens", SDL_GetError(), true);
@@ -1405,15 +1428,19 @@ int main(int argc, char **argv) {
     INISettingsInterface gameManifest(std::filesystem::absolute(manifest).string());
     if (!gameManifest.Load()) throw std::runtime_error("Cannot read arcade game manifest");
     const std::string gameId = gameManifest.GetStringValue("game", "gameid", "");
-    twinSupported = gameId == "NM00012" || gameId == "NM00032";
+    twinSupported = gameId == "NM00012" || gameId == "NM00032" ||
+                    gameId == "NM00001";
     serviceSupported = twinSupported.load();
     isTc4 = gameId == "NM00032";
+    isRidge = gameId == "NM00001";
     // The arcade cabinet ships linked; keep the pair on by default. The menu
     // can turn it off; the choice is persisted under the INI key below.
     twinDefault = twinSupported.load() &&
                   settings->GetBoolValue("TC3", "LinkedCabinet", true);
     tc3::sinden::mode = std::clamp(settings->GetIntValue("Lightgun", "SindenBorder", 1),0,2);
     tc3::sinden::width_percent = std::clamp(settings->GetIntValue("Lightgun", "BorderWidth", 2),1,5);
+    // Driving cabinets have no lightgun: keep the Sinden tracking border off.
+    if (isRidge) tc3::sinden::mode = 0;
     if (const char* role = std::getenv("TC3_CABINET_ROLE")) {
       const char* directory = std::getenv("TC3_CABINET_DIR");
       if (!directory)

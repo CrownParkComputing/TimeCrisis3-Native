@@ -102,6 +102,53 @@ inline bool is_tc3_sram(const std::uint8_t* sram) {
     return std::memcmp(sram + 4, "TST-03A ", 8) == 0;
 }
 
+// Ridge V (NM00001) keeps tagged records (FCAI/SNDT/RID./GER./ACE./R.V./ARC.)
+// in a directory at the head of SRAM; "FCAI" is the fixed first record tag.
+inline bool is_ridge_sram(const std::uint8_t* sram) {
+    return std::memcmp(sram + 4, "FCAI", 4) == 0;
+}
+
+// Ridge V FCAI record, verified by writing the live SRAM and reading the
+// game's own COIN OPTIONS / GAME OPTIONS screens back:
+//   u16 @ 0x00 = checksum = sum8 of every byte from 0x04 to end of data
+//   u16 @ 0x02 = 0x000b (record constant)
+//   0x04..0x07 = "FCAI"
+//   0x08 Game cost (1..9)          0x09 Continue cost (1..9)
+//   0x0A bit0 GP winner svc solo   0x0A bit1 GP winner svc link
+//   0x0B Free play (0=No, 1=Yes)   0x0C Entry wait (2=15s, 3=18s; unverified)
+//   0x0D Select speed (0=A,1=B,2=C) 0x0E Course choice (0=Once,1=Repeat)
+//   0x12 Speed display (0=km/h,1=MPH)
+// Out-of-range bytes fall back to the factory default on the next read, so
+// only fields confirmed through the test menu are exposed here.
+inline const char* const kSelectSpeed[] = {"A (Fast)", "B (Medium)", "C (Slow)"};
+inline const char* const kCourseChoice[] = {"Once", "Repeat"};
+inline const char* const kSpeedDisp[] = {"km/h", "MPH"};
+
+inline constexpr Option kRidgeOptions[] = {
+    {"Game cost",          0, 0, 0x08, 1, kCoins,        9, 0x000u},
+    {"Continue cost",      0, 1, 0x09, 1, kCoins,        9, 0x000u},
+    {"GP winner svc solo", 0, 2, 0x0A, 0, kOnOff,        2, 0x001u},
+    {"GP winner svc link", 0, 3, 0x0A, 0, kOnOff,        2, 0x002u},
+    {"Free play",          0, 4, 0x0B, 0, kNoYes,        2, 0x000u},
+    {"Select speed",       1, 2, 0x0D, 0, kSelectSpeed,  3, 0x000u},
+    {"Course choice",      1, 3, 0x0E, 0, kCourseChoice, 2, 0x000u},
+    {"Speed display",      1, 4, 0x12, 0, kSpeedDisp,    2, 0x000u},
+};
+inline constexpr int kRidgeOptionCount =
+    sizeof(kRidgeOptions) / sizeof(kRidgeOptions[0]);
+inline constexpr int kMaxOptionCount =
+    kOptionCount > kRidgeOptionCount ? kOptionCount : kRidgeOptionCount;
+
+// Checksum covers sram[0x04..0x8000) (the whole FCAI record store; the tail is
+// zeros in every captured image, so summing the full window is equivalent).
+inline std::uint16_t compute_ridge_checksum(const std::uint8_t* sram,
+                                            std::size_t size = 0x8000) {
+    std::uint16_t sum = 0;
+    for (std::size_t i = 4; i < size; ++i)
+        sum = static_cast<std::uint16_t>(sum + sram[i]);
+    return sum;
+}
+
 inline std::uint16_t compute_tc3_checksum(const std::uint8_t* sram) {
     std::uint16_t sum = 0;
     for (int i = 0; i < 0x190; ++i)
@@ -110,6 +157,14 @@ inline std::uint16_t compute_tc3_checksum(const std::uint8_t* sram) {
 }
 
 inline int read_option(const std::uint8_t* sram, int opt_idx) {
+    if (is_ridge_sram(sram)) {
+        if (opt_idx < 0 || opt_idx >= kRidgeOptionCount) return -1;
+        const auto& o = kRidgeOptions[opt_idx];
+        if (o.bit_mask != 0)
+            return (sram[o.sram_off] & o.bit_mask) ? 1 : 0;
+        const int idx = int(sram[o.sram_off]) - int(o.base);
+        return (idx >= 0 && idx < o.num_values) ? idx : -1;
+    }
     if (opt_idx < 0 || opt_idx >= kOptionCount) return -1;
     const auto& o = kOptions[opt_idx];
     if (is_tc3_sram(sram)) {
@@ -139,6 +194,27 @@ inline int read_option(const std::uint8_t* sram, int opt_idx) {
 // EEPROM checksum, and mirror the primary block so both TC3 ("TST-03A ") and
 // TC4 ("TSF100-2-NA") accept the edited EEPROM on boot.
 inline void write_options_and_commit(std::uint8_t* sram, const int* targets, int count) {
+    if (is_ridge_sram(sram)) {
+        for (int i = 0; i < kRidgeOptionCount && i < count; ++i) {
+            const int t = targets[i];
+            if (t < 0 || t >= kRidgeOptions[i].num_values) continue;
+            const auto& o = kRidgeOptions[i];
+            if (o.bit_mask != 0) {
+                if (t) sram[o.sram_off] = static_cast<std::uint8_t>(sram[o.sram_off] | o.bit_mask);
+                else   sram[o.sram_off] = static_cast<std::uint8_t>(sram[o.sram_off] & ~o.bit_mask);
+            } else {
+                sram[o.sram_off] = static_cast<std::uint8_t>(o.base + t);
+            }
+        }
+        // Ridge does not clamp continue cost in its editor, but keeping it
+        // <= game cost matches the original coin-options behaviour.
+        if (sram[0x08] >= 1 && sram[0x09] > sram[0x08])
+            sram[0x09] = sram[0x08];
+        const std::uint16_t ck = compute_ridge_checksum(sram);
+        sram[0x00] = static_cast<std::uint8_t>(ck & 0xffu);
+        sram[0x01] = static_cast<std::uint8_t>((ck >> 8) & 0xffu);
+        return;
+    }
     if (is_tc3_sram(sram)) {
         static constexpr int kTc3Off[kOptionCount] = {0x012, 0x014, 0x016, 0x010, 0x00c, 0x00e, 0x024};
         for (int i = 0; i < kOptionCount && i < count; ++i) {

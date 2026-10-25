@@ -378,13 +378,19 @@ void Render()
     const float row = std::max(26.0f * zoom, font.height + 6);
     constexpr int kTabCount = 3;
     const char* tabs[] = {"File", "Display & Rendering", "Cabinet / Service"};
-    const int service_count = snapshot.service_supported ? tc3::service::kOptionCount : 0;
+    const auto* service_opts = snapshot.is_ridge ? tc3::service::kRidgeOptions
+                                                 : tc3::service::kOptions;
+    const int service_opt_count = snapshot.is_ridge ? tc3::service::kRidgeOptionCount
+                                                    : tc3::service::kOptionCount;
+    const int service_count = snapshot.service_supported ? service_opt_count : 0;
     const int has_save = service_count > 0 ? 1 : 0;
-    const int counts[] = {2, 11, service_count + has_save + 2};
+    // Driving cabinets have no lightgun: the Sinden border rows do not exist
+    // on their Display & Rendering page.
+    const int counts[] = {2, snapshot.has_sinden ? 11 : 9, service_count + has_save + 2};
     if (page >= kTabCount) page = 0;
     const Action cabinet_actions[] = {Action::CabinetService, Action::CabinetCoin};
     const char* cabinet_labels[] = {"Service credit (9)", "Insert coin (5)"};
-    static int pending[tc3::service::kOptionCount]; // -2 = untouched
+    static int pending[tc3::service::kMaxOptionCount]; // -2 = untouched
     static int pending_page = -1;
     if (page != 2) pending_page = -1;
     else if (pending_page != 2) {
@@ -432,7 +438,7 @@ void Render()
                 if (selected < service_count) {
                     int& slot = pending[selected];
                     if (slot == -2) slot = snapshot.service_values[selected];
-                    const int n = tc3::service::kOptions[selected].num_values;
+                    const int n = service_opts[selected].num_values;
                     slot = ((slot < 0 ? 0 : slot) + direction + n) % n;
                 } else if (has_save && selected == service_count) service_apply = true;
                 else if (selected < service_count + has_save + 2)
@@ -536,13 +542,15 @@ void Render()
                 change(rendering::Option::FrameSkip, direction);
             if ((direction = option("VSync", r.vsync ? "On" : "Off", 8, r.ready)))
                 change(rendering::Option::VSync, direction);
-            const char* border_modes[] = {"Off", "Auto detect", "On"};
-            if ((direction = option("Sinden white border", border_modes[std::clamp(r.sinden_border, 0, 2)],
-                                    9, r.ready)))
-                change(rendering::Option::SindenBorder, direction);
-            char border_width[24]; std::snprintf(border_width, sizeof(border_width), "%d%%", r.border_width);
-            if ((direction = option("Border width", border_width, 10, r.ready)))
-                change(rendering::Option::BorderWidth, direction);
+            if (snapshot.has_sinden) {
+                const char* border_modes[] = {"Off", "Auto detect", "On"};
+                if ((direction = option("Sinden white border", border_modes[std::clamp(r.sinden_border, 0, 2)],
+                                        9, r.ready)))
+                    change(rendering::Option::SindenBorder, direction);
+                char border_width[24]; std::snprintf(border_width, sizeof(border_width), "%d%%", r.border_width);
+                if ((direction = option("Border width", border_width, 10, r.ready)))
+                    change(rendering::Option::BorderWidth, direction);
+            }
             note = "Display & rendering settings apply immediately across both linked cabinet screens.";
             if (selected == 2) note = "Boot as a linked left/right cabinet pair by default, like the arcade machine.";
             else if (selected == 3) note = "Fixed window resolution when running single-screen windowed, or Fit to fill.";
@@ -554,7 +562,7 @@ void Render()
             else if (selected >= 9) note = "White reference border for Sinden lightgun camera tracking.";
         } else if (page == 2) {
             for (int i = 0; i < service_count; ++i) {
-                const auto& opt = tc3::service::kOptions[i];
+                const auto& opt = service_opts[i];
                 const int shown = pending[i] != -2 ? pending[i] : snapshot.service_values[i];
                 const char* value = shown >= 0 && shown < opt.num_values ? opt.values[shown] : "?";
                 char label[64];
@@ -574,7 +582,9 @@ void Render()
             if (snapshot.service_state == 2 || snapshot.service_state == 3)
                 note = snapshot.service_note;
             else
-                note = snapshot.is_tc4
+                note = snapshot.is_ridge
+                    ? "Writes directly to cabinet EEPROM (FCAI record checksum) and resets both linked screens together so they pick up the same settings."
+                    : snapshot.is_tc4
                     ? "Writes directly to cabinet EEPROM with a valid TC4 CRC16 checksum and resets both linked screens together so they pick up the same settings."
                     : "Writes directly to cabinet EEPROM (TST-03A checksum) and resets both linked screens together so they pick up the same settings.";
         }
@@ -616,13 +626,13 @@ void Render()
     if (start_twin) Dispatch(Action::StartTwin);
     if (twin_default_toggle) Dispatch(Action::ToggleTwinDefault);
     if (service_apply) {
-        int targets[tc3::service::kOptionCount];
-        for (int i = 0; i < tc3::service::kOptionCount; ++i)
+        int targets[tc3::service::kMaxOptionCount];
+        for (int i = 0; i < service_opt_count; ++i)
             targets[i] = pending[i] == -2 ? -1 : pending[i];
         std::function<void(const int*, int)> apply_callback;
         { std::lock_guard lock(shared.mutex); apply_callback = shared.service_apply_callback; }
-        if (apply_callback) apply_callback(targets, tc3::service::kOptionCount);
-        for (int i = 0; i < tc3::service::kOptionCount; ++i) pending[i] = -2;
+        if (apply_callback) apply_callback(targets, service_opt_count);
+        for (int i = 0; i < tc3::service::kMaxOptionCount; ++i) pending[i] = -2;
         SetOpen(false);
     }
     if (cabinet_action >= 0) {
