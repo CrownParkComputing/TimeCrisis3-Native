@@ -1392,6 +1392,9 @@ int main(int argc, char **argv) {
       throw std::runtime_error("--data-root and --boot-manifest are required");
     CrashHandler::Install();
     Log::SetConsoleOutputLevel(LOGLEVEL_INFO);
+    // Drop stale dev commands left by a dead process so a leftover "dip 0"
+    // cannot boot the machine into test mode.
+    std::remove("/tmp/tc3cmd");
     const char *hardwareError = nullptr;
     if (!VMManager::PerformEarlyHardwareChecks(&hardwareError))
       throw std::runtime_error(hardwareError ? hardwareError
