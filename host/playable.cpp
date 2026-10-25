@@ -34,6 +34,7 @@
 #include "pcsx2/SPU2/spu2.h"
 #include "pcsx2/USB/USB.h"
 #include "pcsx2/VMManager.h"
+#include "pcsx2/VU.h"
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <atomic>
@@ -417,6 +418,20 @@ void scanSettingsShadow() {
             std::fwrite(eeMem->Main, 1, Ps2MemSize::MainRam, f);
             std::fclose(f);
             std::printf("[TC3 dump] eeMem -> %s\n", path);
+          }
+        }
+      } else if (!std::strncmp(line, "vudump ", 7)) {
+        char path[200] = {};
+        if (std::sscanf(line + 7, "%199s", path) == 1 && vuRegs[1].Micro) {
+          if (FILE* f = std::fopen(path, "wb")) {
+            std::fwrite(vuRegs[1].Micro, 1, 16384, f);
+            std::fclose(f);
+            std::printf("[TC3 vudump] VU1 micro -> %s\n", path);
+          }
+          std::string mempath = std::string(path) + ".mem";
+          if (FILE* f = std::fopen(mempath.c_str(), "wb")) {
+            std::fwrite(vuRegs[1].Mem, 1, 16384, f);
+            std::fclose(f);
           }
         }
       } else if (!std::strncmp(line, "poke ", 5)) {
