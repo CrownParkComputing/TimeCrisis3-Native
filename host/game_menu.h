@@ -35,6 +35,7 @@ struct Snapshot {
     float load_progress = 0; // 0..1 real boot stage progress
     char load_stage[96] = {};
     int cabinet_role = -1;   // 0 left, 1 right, -1 solo
+    char pad_name[96] = {};  // connected gamepad, or empty
 };
 
 // Thread-safe UI/CPU entry points. The callback MUST enqueue work on its owner

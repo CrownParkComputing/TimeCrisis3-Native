@@ -180,6 +180,7 @@ def main():
     try:
         for role, root in roots.items():
             env = dict(os.environ, TC3_CABINET_ROLE=role, TC3_CABINET_DIR=str(directory))
+            env['TC3_PAD_INDEX'] = '1' if role == 'right' else '0'
             env.setdefault('SDL_VIDEO_DRIVER', 'x11')
             # One machine, one sound output: only the left cabinet talks.
             if role == 'right':

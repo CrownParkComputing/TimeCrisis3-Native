@@ -94,6 +94,8 @@ std::atomic<bool> twinSupported{false}, twinDefault{false};
 std::atomic<bool> serviceSupported{false};
 std::atomic<bool> isTc4{false}, isRidge{false};
 std::atomic<bool> testModeOn{false}; // DIP0 state; also tracked for the OSD
+std::mutex padNameMutex;             // guards padName (UI writes, CPU reads)
+char padName[96] = {};
 uint64_t milliseconds() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
              Clock::now().time_since_epoch())
@@ -625,6 +627,10 @@ void Host::BeginPresentFrame() {
   ms.is_tc4 = isTc4.load();
   ms.is_ridge = isRidge.load();
   ms.has_sinden = !isRidge.load();
+  {
+    std::lock_guard lock(padNameMutex);
+    std::snprintf(ms.pad_name, sizeof(ms.pad_name), "%s", padName);
+  }
   ms.service_state = svc::pubState.load();
   {
     std::lock_guard lock(statusMutex);
@@ -1352,6 +1358,151 @@ void invokeTracedInput(InputBindingKey key, float value, const char *kind,
   }
   std::fprintf(stderr, "\n");
 }
+// ---- Gamepads -------------------------------------------------------------
+// The upstream SDL input source stays disabled (it would drain this thread's
+// event queue). The frontend opens gamepads itself and translates their
+// events into the existing Keyboard/* bindings, so a pad navigates the menu
+// and drives the game through exactly the same binding path. TC3_PAD_INDEX
+// selects which enumerated pad this process uses; the twin supervisor gives
+// the left worker 0 and the right worker 1, so each cabinet has its own pad.
+int padTargetIndex = -1;
+SDL_Gamepad *pad = nullptr;
+SDL_JoystickID padId = 0;
+struct PadButtonMap { SDL_GamepadButton button; SDL_Keycode key; };
+struct PadAxisMap { SDL_GamepadAxis axis; SDL_Keycode pos, neg; float pos_sent = 0, neg_sent = 0; };
+std::vector<PadButtonMap> padButtons;
+std::vector<PadAxisMap> padAxes;
+SDL_Keycode padKey(const char *section, const char *option,
+                   SDL_Keycode fallback) {
+  for (const auto &bind : settings->GetStringList(section, option))
+    if (bind.rfind("Keyboard/", 0) == 0)
+      if (const SDL_Keycode key = SDL_GetKeyFromName(bind.c_str() + 9))
+        return key;
+  return fallback;
+}
+void setPadName(const char *name) {
+  std::lock_guard lock(padNameMutex);
+  std::snprintf(padName, sizeof(padName), "%s", name ? name : "");
+}
+void padInvoke(SDL_Keycode code, float value) {
+  const auto key = InputManager::MakeHostKeyboardKey(code);
+  Host::RunOnCPUThread(
+      [key, value, code] { invokeTracedInput(key, value, "pad", code); });
+}
+void padZeroAxes() {
+  for (auto &m : padAxes) {
+    if (m.pos_sent > 0) { padInvoke(m.pos, 0); m.pos_sent = 0; }
+    if (m.neg && m.neg_sent > 0) { padInvoke(m.neg, 0); m.neg_sent = 0; }
+  }
+}
+void refreshGamepads() {
+  int count = 0;
+  SDL_JoystickID *ids = SDL_GetGamepads(&count);
+  const SDL_JoystickID want =
+      (ids && padTargetIndex >= 0 && padTargetIndex < count)
+          ? ids[padTargetIndex]
+          : 0;
+  SDL_free(ids);
+  if (pad && padId != want) {
+    padZeroAxes();
+    std::fprintf(stderr, "[TC3 input] gamepad disconnected: %s\n", padName);
+    SDL_CloseGamepad(pad);
+    pad = nullptr;
+    padId = 0;
+    setPadName("");
+  }
+  if (want && padId != want) {
+    pad = SDL_OpenGamepad(want);
+    if (pad) {
+      padId = want;
+      setPadName(SDL_GetGamepadName(pad));
+      std::fprintf(stderr, "[TC3 input] gamepad %d connected: %s\n",
+                   padTargetIndex, padName);
+    }
+  }
+}
+void setupGamepad() {
+  const char *env = std::getenv("TC3_PAD_INDEX");
+  padTargetIndex = env ? std::atoi(env) : 0;
+  if (padTargetIndex < 0)
+    return;
+  const auto button = [](SDL_GamepadButton b, const char *option,
+                         SDL_Keycode fallback, const char *section = "JVS") {
+    padButtons.push_back({b, padKey(section, option, fallback)});
+  };
+  button(SDL_GAMEPAD_BUTTON_DPAD_UP, "P1_Up", SDLK_UP);
+  button(SDL_GAMEPAD_BUTTON_DPAD_DOWN, "P1_Down", SDLK_DOWN);
+  button(SDL_GAMEPAD_BUTTON_DPAD_LEFT, "P1_Left", SDLK_LEFT);
+  button(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, "P1_Right", SDLK_RIGHT);
+  button(SDL_GAMEPAD_BUTTON_START, "P1_Start", SDLK_RETURN);
+  button(SDL_GAMEPAD_BUTTON_BACK, "Coin1", SDLK_5);
+  button(SDL_GAMEPAD_BUTTON_GUIDE, "P1_Service", SDLK_9);
+  if (isRidge) {
+    button(SDL_GAMEPAD_BUTTON_SOUTH, "P1_Start", SDLK_RETURN);
+    button(SDL_GAMEPAD_BUTTON_EAST, "Racing_View_P1", SDLK_V);
+    button(SDL_GAMEPAD_BUTTON_WEST, "Racing_ShiftDown_P1", SDLK_Q);
+    button(SDL_GAMEPAD_BUTTON_NORTH, "Racing_ShiftUp_P1", SDLK_E);
+    button(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, "Racing_ShiftDown_P1", SDLK_Q);
+    button(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, "Racing_ShiftUp_P1", SDLK_E);
+    padAxes.push_back({SDL_GAMEPAD_AXIS_LEFTX, padKey("JVS", "SteerRight", SDLK_D),
+                       padKey("JVS", "SteerLeft", SDLK_A)});
+    padAxes.push_back({SDL_GAMEPAD_AXIS_LEFT_TRIGGER,
+                       padKey("JVS", "Brake", SDLK_S), 0});
+    padAxes.push_back({SDL_GAMEPAD_AXIS_RIGHT_TRIGGER,
+                       padKey("JVS", "Gas", SDLK_W), 0});
+  } else {
+    button(SDL_GAMEPAD_BUTTON_SOUTH, "guncon2_A", SDLK_SPACE, "USB1");
+    button(SDL_GAMEPAD_BUTTON_EAST, "P1_Button1", SDLK_E);
+  }
+}
+void dispatchGamepad(const SDL_Event &e) {
+  if (e.type == SDL_EVENT_GAMEPAD_ADDED ||
+      e.type == SDL_EVENT_GAMEPAD_REMOVED) {
+    refreshGamepads();
+    return;
+  }
+  if (!pad || padTargetIndex < 0)
+    return;
+  if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+      e.type == SDL_EVENT_GAMEPAD_BUTTON_UP) {
+    if (e.gbutton.which != padId)
+      return;
+    for (const auto &m : padButtons) {
+      if (m.button != static_cast<SDL_GamepadButton>(e.gbutton.button))
+        continue;
+      // Re-enter the queue as a real key event so the menu and every
+      // Keyboard/* binding handle it identically to a physical key.
+      SDL_Event se{};
+      se.type = e.gbutton.down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+      se.key.key = m.key;
+      se.key.scancode = SDL_GetScancodeFromKey(m.key, nullptr);
+      se.key.down = e.gbutton.down;
+      se.key.windowID = SDL_GetWindowID(window);
+      SDL_PushEvent(&se);
+      return;
+    }
+  } else if (e.type == SDL_EVENT_GAMEPAD_AXIS_MOTION) {
+    if (e.gaxis.which != padId)
+      return;
+    for (auto &m : padAxes) {
+      if (m.axis != static_cast<SDL_GamepadAxis>(e.gaxis.axis))
+        continue;
+      const float v = std::clamp(e.gaxis.value / 32767.f, -1.f, 1.f);
+      const float deadzone = m.neg ? 0.12f : 0.05f;
+      const float pos = v > deadzone ? v : 0.f;
+      const float neg = m.neg && v < -deadzone ? -v : 0.f;
+      if (std::abs(pos - m.pos_sent) > 0.005f || (pos == 0) != (m.pos_sent == 0)) {
+        m.pos_sent = pos;
+        padInvoke(m.pos, pos);
+      }
+      if (m.neg &&
+          (std::abs(neg - m.neg_sent) > 0.005f || (neg == 0) != (m.neg_sent == 0))) {
+        m.neg_sent = neg;
+        padInvoke(m.neg, neg);
+      }
+    }
+  }
+}
 void dispatchInput(const SDL_Event &e) {
   if (e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP) {
     if (e.key.repeat)
@@ -1448,7 +1599,8 @@ int main(int argc, char **argv) {
       cabinetControl = std::make_unique<tc3::cabinet::SharedControl>(
           std::filesystem::path(directory) / "control.bin", std::string_view(role) == "right" ? 2U : 1U);
     }
-    if (!SDL_Init(SDL_INIT_VIDEO))
+    setupGamepad();
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD))
       throw std::runtime_error(SDL_GetError());
     uiThread = std::this_thread::get_id();
     const auto gameName = gameManifest.GetStringValue("game", "name", "Time Crisis");
@@ -1486,6 +1638,8 @@ int main(int argc, char **argv) {
       SDL_free(displays);
     }
     updateWindow();
+    if (padTargetIndex >= 0)
+      refreshGamepads();
     VMBootParameters params;
     params.filename = std::filesystem::absolute(manifest).string();
     if (!state.empty())
@@ -1567,6 +1721,7 @@ int main(int argc, char **argv) {
         }
         if (e.type == SDL_EVENT_WINDOW_FOCUS_LOST) {
           releaseInputs();
+          padZeroAxes();
           continue;
         }
         if (e.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED ||
@@ -1580,6 +1735,9 @@ int main(int argc, char **argv) {
                                         wi.surface_scale);
           });
         }
+        if (e.type >= SDL_EVENT_GAMEPAD_AXIS_MOTION &&
+            e.type <= SDL_EVENT_GAMEPAD_STEAM_HANDLE_UPDATED)
+          dispatchGamepad(e);
         bool consumed = false;
 #ifdef TC3_GAME_MENU
         consumed = tc3::menu::HandleEvent(e);

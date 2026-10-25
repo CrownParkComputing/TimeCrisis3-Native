@@ -593,8 +593,9 @@ void Render()
             nk_label_wrap(&context, note);
             if (page == 1 && snapshot.valid) {
                 char rate[96];
-                std::snprintf(rate, sizeof(rate), "Game %.2f FPS | Video %.2f Hz | Speed %.1f%%",
-                              snapshot.game_fps, snapshot.video_fps, snapshot.speed_percent);
+                std::snprintf(rate, sizeof(rate), "Game %.2f FPS | Video %.2f Hz | Speed %.1f%% | Pad: %s",
+                              snapshot.game_fps, snapshot.video_fps, snapshot.speed_percent,
+                              snapshot.pad_name[0] ? snapshot.pad_name : "none");
                 nk_layout_row_dynamic(&context, row, 1);
                 nk_label(&context, rate, NK_TEXT_LEFT);
             }
