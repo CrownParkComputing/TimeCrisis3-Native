@@ -33,12 +33,9 @@ that mode records `.local/tc3-live.pid` and `.local/tc3-live.log`.
 | `F9` | Cabinet test mode |
 | `F1` / `F3` | Single-cabinet diagnostic save/load only; disabled for the linked pair |
 
-SDL3 gamepads are detected and hot-plugged automatically (shown as `Pad:` on
-the Display &amp; Rendering tab): D-pad navigates menus, Start = start, Back =
-coin, A = GunCon2 pedal, B = JVS button 1. Pad buttons feed the same
-`Keyboard/*` JVS/USB bindings as the keyboard — aim stays mouse/Sinden. In the
-linked pair the supervisor gives pad 0 to the left screen and pad 1 to the
-right (`TC3_PAD_INDEX` overrides).
+TC3 is a lightgun cabinet: input is mouse or Sinden gun plus keyboard only.
+Gamepads are deliberately not mapped on this title (there is no analog aim);
+pad support applies to driving cabinets such as Ridge Racer V.
 
 Normal boot takes roughly half a minute on the test machine. Movie sequences
 may report 29.97 internal FPS while the machine runs at 100% speed; gameplay was

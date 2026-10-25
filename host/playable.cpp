@@ -1422,6 +1422,10 @@ void refreshGamepads() {
   }
 }
 void setupGamepad() {
+  // Driving cabinets only. Gun games are pointer-aim only (mouse or Sinden):
+  // a pad cannot aim, so TC3/TC4 keep keyboard+pointer input exclusively.
+  if (!isRidge)
+    return;
   const char *env = std::getenv("TC3_PAD_INDEX");
   padTargetIndex = env ? std::atoi(env) : 0;
   if (padTargetIndex < 0)
@@ -1437,23 +1441,18 @@ void setupGamepad() {
   button(SDL_GAMEPAD_BUTTON_START, "P1_Start", SDLK_RETURN);
   button(SDL_GAMEPAD_BUTTON_BACK, "Coin1", SDLK_5);
   button(SDL_GAMEPAD_BUTTON_GUIDE, "P1_Service", SDLK_9);
-  if (isRidge) {
-    button(SDL_GAMEPAD_BUTTON_SOUTH, "P1_Start", SDLK_RETURN);
-    button(SDL_GAMEPAD_BUTTON_EAST, "Racing_View_P1", SDLK_V);
-    button(SDL_GAMEPAD_BUTTON_WEST, "Racing_ShiftDown_P1", SDLK_Q);
-    button(SDL_GAMEPAD_BUTTON_NORTH, "Racing_ShiftUp_P1", SDLK_E);
-    button(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, "Racing_ShiftDown_P1", SDLK_Q);
-    button(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, "Racing_ShiftUp_P1", SDLK_E);
-    padAxes.push_back({SDL_GAMEPAD_AXIS_LEFTX, padKey("JVS", "SteerRight", SDLK_D),
-                       padKey("JVS", "SteerLeft", SDLK_A)});
-    padAxes.push_back({SDL_GAMEPAD_AXIS_LEFT_TRIGGER,
-                       padKey("JVS", "Brake", SDLK_S), 0});
-    padAxes.push_back({SDL_GAMEPAD_AXIS_RIGHT_TRIGGER,
-                       padKey("JVS", "Gas", SDLK_W), 0});
-  } else {
-    button(SDL_GAMEPAD_BUTTON_SOUTH, "guncon2_A", SDLK_SPACE, "USB1");
-    button(SDL_GAMEPAD_BUTTON_EAST, "P1_Button1", SDLK_E);
-  }
+  button(SDL_GAMEPAD_BUTTON_SOUTH, "P1_Start", SDLK_RETURN);
+  button(SDL_GAMEPAD_BUTTON_EAST, "Racing_View_P1", SDLK_V);
+  button(SDL_GAMEPAD_BUTTON_WEST, "Racing_ShiftDown_P1", SDLK_Q);
+  button(SDL_GAMEPAD_BUTTON_NORTH, "Racing_ShiftUp_P1", SDLK_E);
+  button(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, "Racing_ShiftDown_P1", SDLK_Q);
+  button(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, "Racing_ShiftUp_P1", SDLK_E);
+  padAxes.push_back({SDL_GAMEPAD_AXIS_LEFTX, padKey("JVS", "SteerRight", SDLK_D),
+                     padKey("JVS", "SteerLeft", SDLK_A)});
+  padAxes.push_back({SDL_GAMEPAD_AXIS_LEFT_TRIGGER,
+                     padKey("JVS", "Brake", SDLK_S), 0});
+  padAxes.push_back({SDL_GAMEPAD_AXIS_RIGHT_TRIGGER,
+                     padKey("JVS", "Gas", SDLK_W), 0});
 }
 void dispatchGamepad(const SDL_Event &e) {
   if (e.type == SDL_EVENT_GAMEPAD_ADDED ||
